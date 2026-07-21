@@ -1,0 +1,9 @@
+services:
+  sun2000-modbus-cache:
+    build: .
+    restart: unless-stopped
+    environment:
+      SUN2000_HOST: "10.0.0.50"   # your SDongle / inverter address
+      POLL_INTERVAL: "10"
+    ports:
+      - "5502:5502"
