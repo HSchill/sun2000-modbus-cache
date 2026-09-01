@@ -4,6 +4,10 @@ services:
     restart: unless-stopped
     environment:
       SUN2000_HOST: "10.0.0.50"   # your SDongle / inverter address
-      POLL_INTERVAL: "10"
+      POLL_INTERVAL: "10"         # polling variant; use CACHE_TTL for on-demand
     ports:
       - "5502:5502"
+    # Default command runs the polling server. To run a different variant, uncomment one
+    # (and set its env: CACHE_TTL for on-demand; STATE_FILE + a writable volume for adaptive):
+    # command: ["python3", "-u", "ondemand_modbus_cache_server.py"]
+    # command: ["python3", "-u", "adaptive_modbus_cache_server.py"]

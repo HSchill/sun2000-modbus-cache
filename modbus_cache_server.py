@@ -16,7 +16,8 @@ Pure Python standard library — no dependencies.
 Configuration is via environment variables:
     SUN2000_HOST        inverter / SDongle address        (required)
     SUN2000_PORT        inverter Modbus port              (default 502)
-    SUN2000_UNIT_ID     Modbus unit / slave id            (default 1)
+    SUN2000_UNIT_IDS    Modbus unit/slave ids, comma-sep  (default 1)
+    SUN2000_UNIT_ID     single unit id (fallback)         (default 1)
     LISTEN_HOST         address to serve on               (default 0.0.0.0)
     LISTEN_PORT         port to serve on                  (default 5502)
     POLL_INTERVAL       seconds between polls             (default 10)
@@ -33,7 +34,11 @@ import time
 # === Configuration (environment-driven) ===
 SDONGLE_HOST = os.environ.get("SUN2000_HOST")
 SDONGLE_PORT = int(os.environ.get("SUN2000_PORT", 502))
-DEVICE_ID = int(os.environ.get("SUN2000_UNIT_ID", 1))
+# One or more Modbus unit/slave ids to poll, comma-separated (e.g. "1,2,3,4,5").
+# All listed ids share the same REGISTER_BATCHES map. SUN2000_UNIT_ID is accepted
+# as a fallback so the single-slave setup keeps working unchanged.
+_unit_ids = os.environ.get("SUN2000_UNIT_IDS") or os.environ.get("SUN2000_UNIT_ID", "1")
+DEVICE_IDS = [int(x) for x in _unit_ids.split(",") if x.strip()]
 
 SERVER_HOST = os.environ.get("LISTEN_HOST", "0.0.0.0")
 SERVER_PORT = int(os.environ.get("LISTEN_PORT", 5502))
@@ -45,7 +50,8 @@ if not SDONGLE_HOST:
         "Point it at your inverter's SDongle, e.g.  SUN2000_HOST=10.0.0.50 python3 modbus_cache_server.py"
     )
 
-# Register batches to read: (start_address, count).
+# Register batches to read: (start_address, count). This same map is polled for
+# every unit id in DEVICE_IDS.
 # Defaults cover a SUN2000 with a LUNA2000 battery and a grid meter. Trim or
 # extend to match your hardware — reading registers your inverter doesn't expose
 # just logs a failed batch.
@@ -74,23 +80,24 @@ logging.basicConfig(
 logger = logging.getLogger("modbus_cache")
 
 # === Register Cache ===
-# Dict mapping register address -> uint16 value
+# Dict mapping (unit_id, register address) -> uint16 value
 register_cache = {}
 cache_lock = asyncio.Lock()
 last_update = 0
 
 
 def init_cache():
-    """Initialize all register addresses with 0."""
-    for start, count in REGISTER_BATCHES:
-        for i in range(count):
-            register_cache[start + i] = 0
+    """Seed every (unit_id, register) pair with 0."""
+    for uid in DEVICE_IDS:
+        for start, count in REGISTER_BATCHES:
+            for i in range(count):
+                register_cache[(uid, start + i)] = 0
 
 
 # === SDongle Reader ===
-async def read_batch(reader, writer, start, count):
-    """Read a single register batch. Returns list of values or None."""
-    req = struct.pack(">HHHBBHH", 0, 0, 6, DEVICE_ID, 3, start, count)
+async def read_batch(reader, writer, unit_id, start, count):
+    """Read a single register batch from one slave. Returns list of values or None."""
+    req = struct.pack(">HHHBBHH", 0, 0, 6, unit_id, 3, start, count)
     writer.write(req)
     await writer.drain()
 
@@ -133,24 +140,29 @@ async def read_sdongle():
 
     success_count = 0
     fail_count = 0
+    broken = False
 
-    for start, count in REGISTER_BATCHES:
-        try:
-            values = await read_batch(reader, writer, start, count)
-            if values:
-                async with cache_lock:
-                    for i, val in enumerate(values):
-                        register_cache[start + i] = val
-                success_count += 1
-            else:
+    for uid in DEVICE_IDS:
+        for start, count in REGISTER_BATCHES:
+            try:
+                values = await read_batch(reader, writer, uid, start, count)
+                if values:
+                    async with cache_lock:
+                        for i, val in enumerate(values):
+                            register_cache[(uid, start + i)] = val
+                    success_count += 1
+                else:
+                    fail_count += 1
+                await asyncio.sleep(0.05)  # 50ms between reads
+            except asyncio.TimeoutError:
                 fail_count += 1
-            await asyncio.sleep(0.05)  # 50ms between reads
-        except asyncio.TimeoutError:
-            fail_count += 1
-        except Exception as e:
-            logger.warning(f"Error reading {start}: {type(e).__name__}")
-            fail_count += 1
-            break  # Connection likely broken, exit loop
+            except Exception as e:
+                logger.warning(f"Error reading unit {uid} reg {start}: {type(e).__name__}")
+                fail_count += 1
+                broken = True
+                break  # Connection likely broken
+        if broken:
+            break  # socket is dead — abandon this poll, reader_loop will reconnect
 
     try:
         writer.close()
@@ -210,12 +222,11 @@ async def handle_client(client_reader, client_writer):
                 # FC3: Read Holding Registers
                 reg_addr, reg_count = struct.unpack(">HH", pdu[1:5])
 
-                # Serve from cache
+                # Serve from cache for the slave the client addressed
                 values = []
                 async with cache_lock:
                     for i in range(reg_count):
-                        addr_key = reg_addr + i
-                        values.append(register_cache.get(addr_key, 0))
+                        values.append(register_cache.get((unit_id, reg_addr + i), 0))
 
                 # Build response
                 byte_count = reg_count * 2
@@ -302,9 +313,13 @@ async def main():
 
     # Start Modbus TCP server
     server = await asyncio.start_server(handle_client, SERVER_HOST, SERVER_PORT)
+    per_unit = sum(c for _, c in REGISTER_BATCHES)
     logger.info(f"Modbus Cache Server listening on {SERVER_HOST}:{SERVER_PORT}")
     logger.info(f"Polling SDongle at {SDONGLE_HOST}:{SDONGLE_PORT} every {POLL_INTERVAL}s")
-    logger.info(f"Caching {sum(c for _, c in REGISTER_BATCHES)} registers in {len(REGISTER_BATCHES)} batches")
+    logger.info(
+        f"Caching {per_unit} registers/unit x {len(DEVICE_IDS)} unit(s) "
+        f"{DEVICE_IDS} in {len(REGISTER_BATCHES)} batches each"
+    )
 
     # Handle shutdown signals
     stop = asyncio.Event()

@@ -1,0 +1,16 @@
+[Unit]
+Description=Adaptive read-ahead Modbus TCP cache proxy for Huawei SUN2000
+After=network-online.target
+
+[Service]
+Type=simple
+Environment=SUN2000_HOST=10.0.0.50
+Environment=STATE_FILE=/var/lib/sun2000-modbus-cache/adaptive_cache_state.json
+StateDirectory=sun2000-modbus-cache
+ExecStart=/usr/bin/python3 /opt/sun2000-modbus-cache/adaptive_modbus_cache_server.py
+Restart=always
+RestartSec=10
+DynamicUser=yes
+
+[Install]
+WantedBy=multi-user.target

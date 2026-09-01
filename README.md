@@ -83,7 +83,8 @@ All configuration is via environment variables:
 |---|---|---|
 | `SUN2000_HOST` | *(required)* | Inverter / SDongle address |
 | `SUN2000_PORT` | `502` | Inverter Modbus port |
-| `SUN2000_UNIT_ID` | `1` | Modbus unit / slave id |
+| `SUN2000_UNIT_IDS` | `1` | Modbus unit/slave ids to poll, comma-separated (e.g. `1,2,3,4,5`) |
+| `SUN2000_UNIT_ID` | `1` | Single unit id — fallback used when `SUN2000_UNIT_IDS` is unset |
 | `LISTEN_HOST` | `0.0.0.0` | Address to serve on |
 | `LISTEN_PORT` | `5502` | Port to serve on |
 | `POLL_INTERVAL` | `10` | Seconds between inverter polls |
@@ -99,6 +100,137 @@ battery SOC, battery power, and battery charge/discharge totals.
 
 Trim the list to what your hardware actually exposes — requesting registers your
 inverter doesn't have simply logs a failed batch, it won't stop the proxy.
+
+### Multiple slave IDs
+
+For a cascaded setup — several inverters behind one SDongle, addressed by different
+Modbus unit ids — list them all in `SUN2000_UNIT_IDS` (e.g. `SUN2000_UNIT_IDS=1,2,3,4,5`).
+The proxy polls the same `REGISTER_BATCHES` for each id over its single inverter
+connection, caches them separately, and serves each client the slave it addresses via
+the request's unit id. Point one Modbus client per unit id at the proxy, exactly as you
+would at the inverter.
+
+Polling is sequential (~50 ms per batch), so poll time grows with the number of slaves ×
+batches. If a cycle starts approaching `POLL_INTERVAL`, raise the interval or trim the
+register list.
+
+## On-demand variant
+
+`ondemand_modbus_cache_server.py` is an alternative server with the same job but the
+opposite strategy: instead of polling a fixed register set, it **relays exactly what
+clients ask for** and caches each register briefly.
+
+- **No register map.** There is no `REGISTER_BATCHES` to maintain — the cache discovers
+  what your clients actually read. The Modbus unit id is taken from each request and
+  relayed as-is, so cascaded multi-inverter setups need no configuration either.
+- **One connection, still.** All inverter traffic — reads *and* writes — goes through a
+  single persistent connection, serialised so only one request is in flight at a time.
+- **Fresh within `CACHE_TTL`.** A read is served from cache when the requested registers
+  are younger than `CACHE_TTL` (default 10 s); otherwise the missing ones are fetched from
+  the inverter, cached, and returned. Concurrent identical reads collapse into a single
+  inverter request.
+- **Same write-through.** FC6 writes are relayed straight to the inverter, and the written
+  register is invalidated so the next read reflects the new value.
+- **Resilience.** If the inverter is briefly unreachable, previously-seen registers keep
+  being served (stale, logged); a register never read before returns a Modbus "gateway
+  target failed to respond" exception.
+
+### Which should I run?
+
+| | Polling | On-demand | Adaptive |
+|---|---|---|---|
+| File | `modbus_cache_server.py` | `ondemand_modbus_cache_server.py` | `adaptive_modbus_cache_server.py` |
+| Register map | you configure `REGISTER_BATCHES` | none — discovered | none — learned |
+| Read latency | always instant | instant cached; cold read waits a round-trip | almost always instant (warmed ahead of demand) |
+| Inverter load | constant, every `POLL_INTERVAL` | only what clients request (≤1 read/reg/`CACHE_TTL`) | matches learned demand, in idle-closing bursts |
+| Freshness | up to `POLL_INTERVAL` old | up to `CACHE_TTL` old | ~ the client's own poll period |
+| Cloud-friendly | yes — releases the connection between polls | no — holds one connection open | yes — bursts, then idle-closes |
+| Best for | a known, stable sensor set | sparse or changing register use, no map | a cloud-connected SDongle; hands-off |
+
+### Running it
+
+Same as the polling server, except you run the other file and use `CACHE_TTL` instead of
+`POLL_INTERVAL`:
+
+```bash
+SUN2000_HOST=10.0.0.50 CACHE_TTL=10 python3 ondemand_modbus_cache_server.py
+```
+
+The Docker image bundles both servers; override the command to select on-demand:
+
+```yaml
+services:
+  sun2000-modbus-cache:
+    build: .
+    command: ["python3", "-u", "ondemand_modbus_cache_server.py"]
+    environment:
+      SUN2000_HOST: "10.0.0.50"
+      CACHE_TTL: "10"
+    ports:
+      - "5502:5502"
+```
+
+For systemd, use the bundled `sun2000-modbus-cache-ondemand.service` unit in place of
+`sun2000-modbus-cache.service`.
+
+Configuration variables: `SUN2000_HOST`, `SUN2000_PORT`, `LISTEN_HOST`, `LISTEN_PORT`,
+`CACHE_TTL` (default 10), `RECONNECT_BACKOFF` (default 5), `LOG_LEVEL`. There is no
+`REGISTER_BATCHES`, `SUN2000_UNIT_IDS`, or `POLL_INTERVAL`.
+
+## Adaptive variant
+
+`adaptive_modbus_cache_server.py` combines the best of the other two and is the best fit
+when the dongle is *also* reporting to FusionSolar. It **learns** which registers your
+clients read and how often, then keeps just those warm — polling slightly ahead of demand,
+in short bursts, over a connection it drops between bursts.
+
+- **No register map, no unit-id config** — both are discovered from the FC3 requests your
+  clients actually make.
+- **Warm on arrival.** For each register it tracks a moving average of the client's request
+  period and refreshes a little sooner than that, so reads are almost always instant cache
+  hits. A cold or mispredicted read falls back to fetching on demand, so cached data is
+  never wrong.
+- **Cloud-friendly by design.** All inverter traffic uses one connection that is **closed
+  after `IDLE_CLOSE` seconds idle**, and reads happen in bursts — so between bursts the
+  SDongle is free for its ~180 s FusionSolar push. (A persistent local connection is the
+  main thing that disrupts the dongle's cloud reporting; this variant deliberately avoids
+  holding one open.)
+- **Learns the write cadence too.** Each FC6 write is logged with the interval since the
+  previous one, so you can see how often your controller actually writes.
+- **Survives restarts.** The learned model (register set + periods, not values) is written
+  to a JSON state file periodically when it changes, and reloaded at startup — no
+  cold-start.
+
+### Running it
+
+```bash
+SUN2000_HOST=10.0.0.50 python3 adaptive_modbus_cache_server.py
+```
+
+For Docker (bundled in the same image), give it a **writable, mounted path** for the state
+file — the container runs as `nobody`, so the default in-image path isn't writable:
+
+```yaml
+services:
+  sun2000-modbus-cache:
+    build: .
+    command: ["python3", "-u", "adaptive_modbus_cache_server.py"]
+    environment:
+      SUN2000_HOST: "10.0.0.50"
+      STATE_FILE: "/data/adaptive_cache_state.json"
+    volumes:
+      - ./data:/data
+    ports:
+      - "5502:5502"
+```
+
+For systemd, use the bundled `sun2000-modbus-cache-adaptive.service` unit; it sets a
+`StateDirectory`, so the learned model persists under `/var/lib/sun2000-modbus-cache/`.
+
+Configuration variables: `SUN2000_HOST`, `SUN2000_PORT`, `LISTEN_HOST`, `LISTEN_PORT`,
+`MIN_PERIOD` (2), `MAX_PERIOD` (60), `READAHEAD_LEAD` (0.2), `EVICT_AFTER` (300),
+`IDLE_CLOSE` (5), `RECONNECT_BACKOFF` (5), `STATE_FILE`, `STATE_SAVE_INTERVAL` (30),
+`LOG_LEVEL`. There is no `REGISTER_BATCHES` or `POLL_INTERVAL`.
 
 ## Home Assistant
 
