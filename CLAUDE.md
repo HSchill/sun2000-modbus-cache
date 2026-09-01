@@ -27,8 +27,9 @@ There are three independent, self-contained server implementations of the same p
   SDongle — see [[sdongle-cloud-vs-local-modbus-contention]].
 
 All three are Python standard library only (asyncio, struct), require Python 3.8+, and
-have **no third-party dependencies, no build step, no committed test suite, and no lint
-config**. The sections below describe the polling server unless noted.
+have **no third-party dependencies, no build step, and no lint config**. An integration
+test suite lives under `tests/` (see Run / develop). The sections below describe the
+polling server unless noted.
 
 ## Run / develop
 
@@ -37,10 +38,21 @@ SUN2000_HOST=10.0.0.50 python3 modbus_cache_server.py   # run against a real inv
 docker compose up -d                                    # edit SUN2000_HOST in docker-compose.yml first
 ```
 
-There is no automated test suite. To exercise a change without an inverter, point
-`SUN2000_HOST` at any reachable host (polls will fail and log, the FC3/FC6 server still
-runs) and drive it with a Modbus client on `LISTEN_PORT` (default 5502). Set
-`LOG_LEVEL=DEBUG` for per-batch detail.
+Run the integration suite (standard library only; starts everything as real subprocesses
+over real TCP):
+
+```bash
+python3 tests/run_integration_test.py [polling|ondemand|adaptive|all]
+```
+
+It launches a stateful dummy dongle (`tests/dummy_dongle.py`) and each server, then drives
+two concurrent readers + a write-with-readback and checks: consistent cached reads, the
+write reaching the dongle, write-readback (on-demand/adaptive), dongle shielding, the
+single-connection discipline, the adaptive idle-close/reconnect, and — with the dongle
+capped at one connection (`DONGLE_MAX_CONNS=1`) — that the proxy serves many clients while
+a direct client is refused. `tests/dummy_dongle.py` also runs standalone
+(`DONGLE_PORT=15599 python3 tests/dummy_dongle.py`) to point a server at without real
+hardware; set `LOG_LEVEL=DEBUG` on a server for per-request detail.
 
 Config is entirely environment variables (see the header docstring and README table):
 `SUN2000_HOST` (required), `SUN2000_PORT`, `SUN2000_UNIT_IDS` (comma-separated slave
@@ -117,9 +129,10 @@ Key pieces:
   `CannotServe(0x0B)` (gateway-target-failed). FC6 write success **invalidates** the
   cached register (`CACHE.pop`) rather than assuming the written value reads back.
 
-Behavior is verified with an in-process fake-inverter harness (cache hit/miss/TTL,
-coalescing, write-invalidation, stale-serve, gateway exception) — not committed; recreate
-it when changing this file.
+Behavior is covered by the `tests/` integration suite (write-readback, dongle shielding,
+persistent-connection / *no* idle-close). For finer-grained checks (TTL expiry,
+coalescing, stale-serve, gateway exception) an in-process fake-inverter harness against the
+module functions is quick to write.
 
 ### Adaptive variant (`adaptive_modbus_cache_server.py`)
 
@@ -144,3 +157,7 @@ learning + read-ahead. Key pieces:
   gitignored.
 - **`_log_write`** logs each FC6 with the interval since the previous write, to reveal how
   often the controller actually writes (the Reduxi "writes are rare" assumption).
+
+The `tests/` integration suite exercises this variant end-to-end: read-ahead warming,
+write-readback, JSON persistence, idle-close + on-demand reconnect, and the
+connection-limit value (proxy serves many clients while a direct client is refused).
