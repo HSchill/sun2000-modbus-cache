@@ -26,6 +26,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `sun2000-modbus-cache-adaptive.service`. The Docker image now bundles all three servers,
   and the container command selects the variant.
 - `CLAUDE.md` guidance file for working in the repository.
+- Integration test suite under `tests/`: a stateful dummy SDongle (`tests/dummy_dongle.py`)
+  and a driver (`tests/run_integration_test.py`) that runs each variant as a real
+  subprocess with two concurrent readers and a write-with-readback, covering dongle
+  shielding, the single-connection discipline, the adaptive idle-close/reconnect, and the
+  connection-limit behaviour (proxy serves many clients while a direct client is refused).
 
 ### Changed
 

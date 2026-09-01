@@ -220,6 +220,8 @@ class InverterLink:
         interval = max(0.5, min(IDLE_CLOSE, 2.0))
         while True:
             await asyncio.sleep(interval)
+            # Take the lock so we never drop the socket mid-transaction. Closing when idle
+            # frees the dongle's single connection slot for its FusionSolar cloud push.
             async with self._lock:
                 if self._writer is not None and \
                         time.monotonic() - self._last_used >= IDLE_CLOSE:
@@ -262,14 +264,19 @@ def _record_demand(unit, addr, count, now):
         key = (unit, a)
         d = DEMAND.get(key)
         if d is None:
+            # First time we've seen this register: add it and wake the scheduler so it
+            # starts warming it. Period stays unknown until we observe a second request.
             DEMAND[key] = {"last_req": now, "period": None}
             _mark_dirty()
             if _demand_event is not None:
                 _demand_event.set()
             continue
+        # Learn the client's cadence: seed the period from the first observed gap, then
+        # smooth later gaps with an EMA. Two clients reading the same register make the
+        # gaps shorter, so the period naturally tracks the fastest consumer.
         gap = now - d["last_req"]
         d["last_req"] = now
-        if 0 < gap <= EVICT_AFTER:  # ignore zero/absurd gaps
+        if 0 < gap <= EVICT_AFTER:  # ignore zero (simultaneous clients) / absurd gaps
             d["period"] = gap if d["period"] is None else \
                 EMA_ALPHA * gap + (1 - EMA_ALPHA) * d["period"]
             _mark_dirty()
@@ -292,6 +299,8 @@ def _contiguous_runs(addrs, max_run):
 async def _fetch_run(unit, start, count):
     """Read [start, start+count) for `unit` through the link, coalescing concurrent
     identical fetches (scheduler + client fallbacks) into one inverter transaction."""
+    # Coalesce on the exact (unit, start, count): concurrent identical fetches — the
+    # scheduler and a client fallback, or two clients — share one inverter transaction.
     key = (unit, start, count)
     existing = INFLIGHT.get(key)
     if existing is not None:
@@ -327,6 +336,9 @@ async def serve_read(unit, addr, count):
     now = time.monotonic()
     _record_demand(unit, addr, count, now)
 
+    # A register is served from cache while it is younger than its learned period; the
+    # scheduler normally keeps it fresher than that, so this is usually a pure cache hit.
+    # Whatever is missing or stale is fetched below — the cold / mispredicted path.
     async with CACHE_LOCK:
         needed = []
         for a in range(addr, addr + count):
@@ -346,6 +358,9 @@ async def serve_read(unit, addr, count):
             continue
         await _store(unit, start, values)
 
+    # Assemble the reply from cache. A register still missing here was never cached and
+    # its fetch just failed (inverter unreachable) — we cannot fabricate it, so fail the
+    # whole request; a stale-but-present value is served instead (see fetch_failed below).
     async with CACHE_LOCK:
         out = []
         for a in range(addr, addr + count):
@@ -382,11 +397,14 @@ async def scheduler_loop():
             async with CACHE_LOCK:
                 ce = CACHE.get(key)
             read_ts = ce[1] if ce else 0.0
+            # Read-ahead: refresh a fraction of a period *before* the value would go stale
+            # for its client, so the next client read finds it warm. A never-read register
+            # has read_ts 0, making due_at 0, so it is fetched on the next tick.
             due_at = read_ts + _eff_period(d) * (1 - READAHEAD_LEAD)
             if due_at <= now:
                 due_by_unit.setdefault(unit, []).append(a)
             else:
-                next_wake = min(next_wake, due_at)
+                next_wake = min(next_wake, due_at)  # wake exactly when the soonest is due
 
         # Read the due registers, one contiguous burst at a time.
         for unit, addrs in due_by_unit.items():
@@ -400,6 +418,9 @@ async def scheduler_loop():
                     break             # link down; retry next tick
                 await _store(unit, start, values)
 
+        # Sleep until the soonest register is due, but wake early if new demand arrives
+        # (a brand-new register sets _demand_event). The floor stops busy-spinning; the
+        # ceiling guarantees we re-check for evictions at least every SCHED_MAX_SLEEP.
         sleep = max(0.2, min(SCHED_MAX_SLEEP, next_wake - time.monotonic()))
         try:
             await asyncio.wait_for(_demand_event.wait(), timeout=sleep)

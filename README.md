@@ -287,6 +287,19 @@ detail here:
 Built and run in production on a ~9 kWp SUN2000 with a LUNA2000 battery, serving
 Home Assistant and an AC·THOR surplus heater at the same time.
 
+### Tested environment
+
+The multi-slave, on-demand and adaptive work was validated against:
+
+- **Home Assistant** 2026.8.3 with the [Huawei Solar](https://github.com/wlcrs/huawei_solar)
+  integration v2.13
+- **Reduxi** controller (dynamic-tariff battery / energy management)
+- **Huawei SDongleA-05**, firmware `V200R022C10SPC312`
+  - Inverters: 2 × **SUN2000-10KTL-M1**, `V100R001C00SPC173` — Modbus unit ids **16** and
+    **1** (so the polling variant runs with `SUN2000_UNIT_IDS=16,1`)
+  - Batteries: 2 × **LUNA2000-1** 10 kWh, `V100R002C00SPC637`
+  - Meter: **DTSU666H**
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
