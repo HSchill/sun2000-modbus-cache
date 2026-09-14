@@ -345,6 +345,77 @@ def report_limit(res):
     return ok
 
 
+async def run_warmup(name, dport, sport):
+    """The real SDongle stays silent for a few seconds after connect (warm-up). The proxy
+    must HOLD one connection through that — a read timeout must not drop it — and start
+    serving once the warm-up ends, rather than churning a fresh connection each timeout."""
+    script, _ = SPECS[name]
+    state = f"/tmp/itest_warmup_{name}_state.json"
+    for f in (state, state + ".tmp"):
+        try: os.remove(f)
+        except FileNotFoundError: pass
+
+    dproc, dlines, dtask = await spawn(
+        ["python3", "-u", DONGLE], {"DONGLE_PORT": str(dport), "DONGLE_WARMUP": "3"})
+    if not await wait_port(dport):
+        await stop(dproc)
+        return {"name": name, "error": "dongle didn't start"}
+
+    # READ_TIMEOUT=2 is shorter than the 3 s warm-up, so the first reads time out — the
+    # proxy must keep the connection anyway.
+    senv = {"SUN2000_HOST": "127.0.0.1", "SUN2000_PORT": str(dport),
+            "LISTEN_HOST": "127.0.0.1", "LISTEN_PORT": str(sport),
+            "STATE_FILE": state, "LOG_LEVEL": "INFO",
+            "READ_TIMEOUT": "2", "IDLE_CLOSE": "0", "MIN_PERIOD": "1", "MAX_PERIOD": "10"}
+    sproc, slines, stask = await spawn(["python3", "-u", os.path.join(ROOT, script)], senv)
+    if not await wait_port(sport):
+        await stop(sproc); await stop(dproc)
+        return {"name": name, "error": "server didn't start", "log": slines[-10:]}
+
+    loop = asyncio.get_running_loop()
+    r, w = await asyncio.open_connection("127.0.0.1", sport)
+    any_ok = False; first_ok = None; t0 = loop.time()
+    try:
+        while loop.time() - t0 < 10:
+            try:
+                kind, _ = await fc3(r, w, 1, 32064, 2)
+            except Exception:
+                kind = "err"
+            if kind == "ok" and not any_ok:
+                any_ok = True; first_ok = loop.time() - t0
+            await asyncio.sleep(1.5)
+    finally:
+        w.close(); await w.wait_closed()
+        await stop(sproc); await stop(dproc)
+        await dtask; await stask
+
+    for f in (state, state + ".tmp"):
+        try: os.remove(f)
+        except FileNotFoundError: pass
+
+    d = parse_dongle(dlines)
+    return {"name": name, "any_ok": any_ok, "first_ok": first_ok,
+            "conns_total": d.get("conns_total"), "conns_max": d.get("conns_max")}
+
+
+def report_warmup(res):
+    print("-" * 68)
+    print(f"WARM-UP / HOLD ({res['name']}, dongle 3 s warm-up, proxy READ_TIMEOUT=2 s):")
+    if res.get("error"):
+        print("  ERROR:", res["error"])
+        for ln in res.get("log", []):
+            print("   |", ln)
+        return False
+    served = f"yes (first OK ~{res['first_ok']:.1f}s)" if res["any_ok"] else "no"
+    print(f"  served after warm-up: {served}")
+    print(f"  dongle connections: total={res['conns_total']} max={res['conns_max']} "
+          f"(hold = no reconnect churn on read timeouts)")
+    ok = res["any_ok"] and res["conns_total"] in ("1", "2")   # 2 = wait_port probe + 1 held
+    print(f"    [{'PASS' if ok else 'FAIL'}] proxy holds ONE connection through the "
+          "warm-up and serves once it ends")
+    return ok
+
+
 def report(res, overall):
     print("=" * 68)
     print(f"SERVER: {res['name']}")
@@ -412,6 +483,12 @@ async def main():
         print("CONNECTION-LIMIT VALUE (why the proxy exists)")
         res = await run_conn_limit(limit_name, 15750, 15751)
         overall = report_limit(res) and overall
+
+    if "adaptive" in names:
+        print("=" * 68)
+        print("SDONGLE WARM-UP (hold the connection through post-connect silence)")
+        res = await run_warmup("adaptive", 15760, 15761)
+        overall = report_warmup(res) and overall
 
     print("=" * 68)
     print("OVERALL:", "PASS" if overall else "FAIL")

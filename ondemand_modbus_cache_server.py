@@ -15,8 +15,12 @@ the inverter.
       the SUN2000/SDongle tolerates only a couple of connections, so we occupy one
       and fan out to any number of clients.
     - Concurrent identical reads are coalesced into a single inverter transaction.
-    - Writes (FC6) are relayed straight through; the written register is invalidated
-      afterwards so the next read reflects the new value.
+    - Writes (FC6 single, FC16 multiple) are relayed straight through; the written
+      register(s) are invalidated afterwards so the next read reflects the new value.
+    - The Huawei private function code 0x41 (installer-login challenge/response that unlocks
+      the 47xxx control registers) is relayed verbatim — the client does the SHA-256/HMAC
+      crypto; the proxy is just a pipe.
+    - Any other function code returns an "illegal function" exception (and is logged).
     - If the inverter is briefly unreachable, previously-seen registers keep being
       served (stale, logged) instead of failing; never-seen registers return a
       Modbus "gateway target failed to respond" exception.
@@ -62,6 +66,8 @@ if not SDONGLE_HOST:
 
 # Protocol / timeout constants
 MAX_READ = 125            # Modbus FC3 maximum registers per request
+MAX_WRITE = 123           # Modbus FC16 maximum registers per request
+PRIVATE_FC = 0x41         # Huawei private FC (installer login handshake) — relayed verbatim
 CONNECT_TIMEOUT = 10
 READ_TIMEOUT = 3
 WRITE_TIMEOUT = 10
@@ -183,6 +189,52 @@ class InverterLink:
             except Exception as e:
                 await self._drop()
                 raise ConnectionError(f"write failed: {type(e).__name__}: {e}")
+
+    async def write_multiple(self, unit, addr, values):
+        """Write multiple registers (FC16). Raises on failure."""
+        n = len(values)
+        async with self._lock:
+            if self._writer is None:
+                await self._connect()
+            req = (struct.pack(">HHHBBHHB", self._next_tx(), 0, 7 + n * 2, unit, 16, addr, n, n * 2)
+                   + struct.pack(">" + "H" * n, *values))
+            try:
+                self._writer.write(req)
+                await self._writer.drain()
+                r = self._reader
+                head = await asyncio.wait_for(r.readexactly(8), timeout=WRITE_TIMEOUT)
+                _tx, _proto, length, _unit, fc = struct.unpack(">HHHBB", head)
+                if fc >= 0x80:
+                    exc = await asyncio.wait_for(r.readexactly(1), timeout=WRITE_TIMEOUT)
+                    raise ModbusException(exc[0])
+                # Normal echo: addr(2) + qty(2) follow the fc; length counts unit+PDU.
+                await asyncio.wait_for(r.readexactly(length - 2), timeout=WRITE_TIMEOUT)
+                return True
+            except ModbusException:
+                raise
+            except Exception as e:
+                await self._drop()
+                raise ConnectionError(f"write_multiple failed: {type(e).__name__}: {e}")
+
+    async def raw(self, unit, pdu):
+        """Relay an arbitrary request PDU (e.g. the Huawei private FC 0x41 installer-login
+        challenge/response) and return the raw response PDU verbatim, including any exception
+        PDU. The proxy does no interpretation — the client does the SHA-256/HMAC crypto."""
+        async with self._lock:
+            if self._writer is None:
+                await self._connect()
+            req = struct.pack(">HHHB", self._next_tx(), 0, len(pdu) + 1, unit) + bytes(pdu)
+            try:
+                self._writer.write(req)
+                await self._writer.drain()
+                r = self._reader
+                head = await asyncio.wait_for(r.readexactly(7), timeout=WRITE_TIMEOUT)
+                _tx, _proto, length, _unit = struct.unpack(">HHHB", head)
+                rest = await asyncio.wait_for(r.readexactly(length - 1), timeout=WRITE_TIMEOUT)
+                return rest        # response PDU (fc + payload), verbatim
+            except Exception as e:
+                await self._drop()
+                raise ConnectionError(f"raw relay failed: {type(e).__name__}: {e}")
 
     async def _read_response(self, expect):
         """Parse one FC3 response off the wire. Caller holds the lock and has just
@@ -309,6 +361,7 @@ def _exception_pdu(fc, code):
 async def handle_client(client_reader, client_writer):
     """Handle a single Modbus TCP client connection."""
     addr = client_writer.get_extra_info("peername")
+    peer_ip = addr[0] if addr else "?"
     logger.info(f"Client connected: {addr}")
 
     try:
@@ -346,7 +399,7 @@ async def handle_client(client_reader, client_writer):
             elif fc == 6 and len(pdu) >= 5:
                 # FC6: Write Single Register — relay to the inverter
                 reg_addr, reg_value = struct.unpack(">HH", pdu[1:5])
-                logger.info(f"Write from {addr}: unit {unit_id} reg {reg_addr} = {reg_value}")
+                logger.info(f"WRITE src={peer_ip} unit={unit_id} reg {reg_addr} = {reg_value}")
                 try:
                     await LINK.write(unit_id, reg_addr, reg_value)
                     async with CACHE_LOCK:
@@ -360,8 +413,47 @@ async def handle_client(client_reader, client_writer):
                                                _exception_pdu(fc, EXC_DEVICE_FAILURE)))
                 await client_writer.drain()
 
+            elif fc == 16 and len(pdu) >= 6:
+                # FC16: Write Multiple Registers — relay to the inverter
+                reg_addr, reg_count = struct.unpack(">HH", pdu[1:5])
+                byte_count = pdu[5]
+                if not (1 <= reg_count <= MAX_WRITE) or byte_count != reg_count * 2 \
+                        or len(pdu) < 6 + byte_count:
+                    client_writer.write(_frame(tx_id, unit_id,
+                                               _exception_pdu(fc, EXC_ILLEGAL_DATA_VALUE)))
+                    await client_writer.drain()
+                    continue
+                values = list(struct.unpack(">" + "H" * reg_count, pdu[6:6 + byte_count]))
+                logger.info(f"WRITE src={peer_ip} unit={unit_id} reg {reg_addr}..{reg_addr + reg_count - 1} = {values}")
+                try:
+                    await LINK.write_multiple(unit_id, reg_addr, values)
+                    async with CACHE_LOCK:
+                        for i in range(reg_count):
+                            CACHE.pop((unit_id, reg_addr + i), None)  # invalidate the range
+                    resp_pdu = struct.pack(">BHH", fc, reg_addr, reg_count)
+                    client_writer.write(_frame(tx_id, unit_id, resp_pdu))
+                except ModbusException as e:
+                    client_writer.write(_frame(tx_id, unit_id, _exception_pdu(fc, e.code)))
+                except ConnectionError:
+                    client_writer.write(_frame(tx_id, unit_id,
+                                               _exception_pdu(fc, EXC_DEVICE_FAILURE)))
+                await client_writer.drain()
+
+            elif fc == PRIVATE_FC and len(pdu) >= 2:
+                # Huawei private FC 0x41 (installer login challenge/response) — relayed
+                # verbatim; the client does the SHA-256/HMAC crypto. Not cached.
+                try:
+                    resp_pdu = await LINK.raw(unit_id, pdu)
+                    client_writer.write(_frame(tx_id, unit_id, resp_pdu))
+                except ConnectionError:
+                    client_writer.write(_frame(tx_id, unit_id,
+                                               _exception_pdu(fc, EXC_DEVICE_FAILURE)))
+                await client_writer.drain()
+
             else:
                 # Unsupported function code
+                logger.warning(f"Unsupported function code 0x{fc:02X} from {addr} "
+                               f"(unit {unit_id}) -> illegal-function 0x01")
                 client_writer.write(_frame(tx_id, unit_id,
                                            _exception_pdu(fc, EXC_ILLEGAL_FUNCTION)))
                 await client_writer.drain()

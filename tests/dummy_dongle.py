@@ -21,11 +21,15 @@ import asyncio
 import os
 import signal
 import struct
+import time
 
 HOST = os.environ.get("DONGLE_HOST", "0.0.0.0")
 PORT = int(os.environ.get("DONGLE_PORT", 502))
 DELAY = float(os.environ.get("DONGLE_DELAY", 0))
 MAX_CONNS = int(os.environ.get("DONGLE_MAX_CONNS", 0))
+# Like the real SDongle: for the first WARMUP seconds of each connection, silently ignore
+# reads (no response) to simulate the post-connect warm-up.
+WARMUP = float(os.environ.get("DONGLE_WARMUP", 0))
 
 store = {}          # (unit, addr) -> value
 fc3_count = 0
@@ -49,6 +53,7 @@ async def handle(reader, writer):
     conns_total += 1
     conns_open += 1
     conns_max = max(conns_max, conns_open)
+    conn_start = time.monotonic()
     print(f"[dongle] connect {peer} (open={conns_open}, total={conns_total})", flush=True)
     try:
         while True:
@@ -58,6 +63,12 @@ async def handle(reader, writer):
             fc = pdu[0]
             if DELAY:
                 await asyncio.sleep(DELAY)
+
+            if fc == 3 and WARMUP and time.monotonic() - conn_start < WARMUP:
+                # simulate the SDongle warm-up: swallow the read, send nothing
+                print(f"[dongle] FC3 during warm-up "
+                      f"({time.monotonic() - conn_start:.1f}s) -> silent", flush=True)
+                continue
 
             if fc == 3:
                 fc3_count += 1

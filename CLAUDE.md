@@ -19,12 +19,18 @@ There are three independent, self-contained server implementations of the same p
   inverter I/O goes through one persistent, mutex-guarded connection (reads *and* writes),
   with concurrent-identical-read coalescing. First read of a cold/expired register pays
   the inverter round-trip.
-- **`adaptive_modbus_cache_server.py`** — *adaptive read-ahead*. Learns the register set
-  *and* each register's request period from client traffic, then a scheduler keeps the
-  cache warm by polling that set slightly ahead of demand, in bursts through one
-  idle-closing connection (so the dongle is free for its FusionSolar push between reads).
-  Persists the learned model to a JSON state file. Best fit for the cloud-connected
-  SDongle — see [[sdongle-cloud-vs-local-modbus-contention]].
+- **`adaptive_modbus_cache_server.py`** — *serialising control proxy*. The hardened variant
+  for the shared production dongle (Reduxi EMS writes + Home Assistant reads on one SDongle).
+  Holds ONE persistent connection whose lifecycle is fully decoupled from downstream clients,
+  funnels every read/write/relay through a single FIFO queue + worker (exactly one upstream
+  transaction in flight, ever), reconnects with exponential backoff, keeps the socket alive
+  when idle, and retries ServerBusy/timeouts with a per-transaction time cap. Adds a
+  deny-by-default per-source write ACL, high-risk-write gating, unchanged-write suppression,
+  a short-TTL read cache, FC-0x17 rejection, and full request/response + connection-state +
+  register audit logging. See the persistent-connection finding
+  [[sdongle-requires-persistent-modbus-connection]]. (It grew out of an earlier learned
+  read-ahead design; that scheduler / DEMAND model / JSON persistence were removed in the
+  hardening rework.)
 
 All three are Python standard library only (asyncio, struct), require Python 3.8+, and
 have **no third-party dependencies, no build step, and no lint config**. An integration
@@ -126,8 +132,15 @@ Key pieces:
   map, so a herd of clients requesting the same range causes one inverter transaction.
 - **Failure policy** (as chosen): inverter unreachable → serve last-known value for
   previously-seen registers (logged), but a *never-seen* register raises
-  `CannotServe(0x0B)` (gateway-target-failed). FC6 write success **invalidates** the
-  cached register (`CACHE.pop`) rather than assuming the written value reads back.
+  `CannotServe(0x0B)` (gateway-target-failed). FC6 (single) and FC16 (multiple) write
+  success **invalidates** the written register(s) (`CACHE.pop`) rather than assuming the
+  value reads back; any other function code returns illegal-function `0x01` (logged).
+- **Huawei private FC `0x41` is relayed verbatim** (`InverterLink.raw`) — the installer-login
+  challenge/response that unlocks the `47xxx` control registers. The proxy does no crypto;
+  the client (e.g. Reduxi / huawei-solar-lib's `PrivateHuaweiModbusRequest`) computes the
+  SHA-256/HMAC digest. It authenticates the proxy's *shared* held connection, so a reconnect
+  drops the auth (the client must re-login on write rejection). Adaptive pauses read-ahead
+  (`LOGIN_GRACE`) around it so intervening reads don't disrupt the handshake.
 
 Behavior is covered by the `tests/` integration suite (write-readback, dongle shielding,
 persistent-connection / *no* idle-close). For finer-grained checks (TTL expiry,
@@ -136,28 +149,72 @@ module functions is quick to write.
 
 ### Adaptive variant (`adaptive_modbus_cache_server.py`)
 
-Builds on the on-demand `InverterLink` (same single-connection discipline) and adds
-learning + read-ahead. Key pieces:
+The hardened, production variant: a **serialising control proxy** in front of the shared
+SDongle. Its job is to present a rock-solid link to both clients so Reduxi never sees a
+"Communication error" (which makes it trip its safety fallback, lose battery telemetry, and
+revert the inverters to self-consumption). Cross-validating proxy logs against Reduxi's own
+CSV export tied those fallbacks to Modbus link wobble, not a Reduxi logic bug — so the
+whole design goal is **zero upstream disruption**. Key pieces (top-of-file docstring has the
+full env-var list):
 
-- **`DEMAND`** (`(unit,addr) -> {last_req, period}`) is the learned model. `_record_demand`
-  updates it on every client FC3 — even cache hits, since we always see the request — using
-  an EMA of the inter-arrival gap as the period. `_eff_period` clamps to
-  `[MIN_PERIOD, MAX_PERIOD]`.
-- **`scheduler_loop`** refreshes each learned register when `read_ts + period*(1-READAHEAD_LEAD)`
-  is due, grouping due registers into contiguous bursts, and evicts registers unrequested
-  for `EVICT_AFTER`. It waits on `_demand_event` so new demand wakes it promptly.
-- **`serve_read`** is the on-demand read-through but with per-register freshness = learned
-  period (not a global TTL); the scheduler keeps most reads as pure cache hits, and a cold
-  or mispredicted read falls back to fetching now.
-- **`InverterLink.idle_closer`** drops the socket after `IDLE_CLOSE` — this is what makes
-  the bursty polling FusionSolar-friendly. Don't remove it.
-- **Persistence**: `load_state` seeds `DEMAND` at startup; `state_saver_loop` calls
-  `save_state` every `STATE_SAVE_INTERVAL` when `_model_dirty` (atomic write via
-  `os.replace`). Only the register set + periods are saved, never values. State file is
-  gitignored.
-- **`_log_write`** logs each FC6 with the interval since the previous write, to reveal how
-  often the controller actually writes (the Reduxi "writes are rare" assumption).
+- **`Upstream`** owns the *single persistent* TCP connection and is touched by **nothing but
+  the worker** — so no lock is needed on the socket. `connect_once`/`drop` log every state
+  transition; `note_ok`/`note_fail` drive exponential backoff (`BACKOFF_MIN..MAX`) and a
+  `DEGRADED_THRESHOLD` consecutive-failure health flag. `warm` gives the first read after a
+  (re)connect a longer `WARMUP_TIMEOUT` (the dongle needs ~8–15 s to warm a fresh session —
+  see [[sdongle-requires-persistent-modbus-connection]]).
+- **`QUEUE` + `upstream_worker`** are the heart: every read/write/relay is a `submit()` that
+  enqueues one op and awaits a future. The single worker pulls FIFO and runs `_do_transaction`
+  — so there is **exactly one upstream transaction in flight, ever**, regardless of how many
+  downstream clients connect. `_do_transaction` enforces `MIN_GAP` between requests, retries
+  ServerBusy(0x06)/timeout with backoff, reconnects on transport error, and is bounded by
+  `TXN_MAX` (a per-transaction time cap so one bad register can't wedge the queue — it fails
+  that op and moves on). Because the queue is strictly FIFO/single-worker, a chronically-slow
+  or nonresponsive register **head-of-line-blocks every other client** for up to `TXN_MAX`;
+  keep `TXN_MAX` small (default 6 s, was 20 s — production evidence: a register the dongle
+  wouldn't answer caused a live HA read to hang 25+ s behind it). `QUEUE_MAX_WAIT` is a second
+  line of defence: an item that's already waited longer than that when dequeued is failed
+  immediately with **no upstream I/O**, so a backlog can't keep growing the worst case. The
+  worker logs per-txn queue wait/depth/attempts at DEBUG.
+- **Downstream lifecycle is fully decoupled from upstream.** Clients (Reduxi/HA) cycle TCP
+  sessions every few seconds; `handle_client` connect/disconnect never touches `Upstream`.
+  This is the P0 invariant — a churn test proves 300 short-lived clients cause exactly one
+  upstream connection. **Preserve it.**
+- **`keepalive_loop`** issues a no-op read (`KEEPALIVE_REG` on `KEEPALIVE_UNIT`) after
+  `KEEPALIVE` idle seconds so the dongle doesn't silently close the socket between bursts.
+  **`health_loop`** logs a periodic health line (connected / degraded / consec-fail /
+  last-ok age / queue depth / suppressed-write count).
+- **`serve_read`** is a short-TTL (`READ_TTL`, default 2 s) read-through with
+  concurrent-identical-read coalescing (`INFLIGHT`) — it exists to fold *near-simultaneous*
+  reads of the same register from both clients into one round-trip, not to shield periodic
+  polling. Writes invalidate the cached registers. **A failed upstream read falls back to the
+  last-known cached value** (`result="stale"`) rather than failing the client outright — this
+  always logs a `STALE` WARNING (bypassing `READ_LOG_MUTE`, since staleness is a health signal,
+  not routine poll chatter) and bumps `_stale_count`. This was previously silent: a chronically
+  failing register served hours-old data to a muted source (HA) with zero visibility in the
+  log — only a manual `SIGHUP` audit dump revealed it.
+- **Write path** (`_do_write`), in order: deny-by-default per-source ACL (`WRITE_DENY` first,
+  then `WRITE_ALLOW`; default `172.24.1.15`=Reduxi may write anything, `172.24.1.97`=HA
+  none) → **high-risk gate** (`HIGH_RISK`, e.g. `47590==0` zeroing charge-from-grid, blocked
+  for everyone unless the register is in `HIGH_RISK_ALLOW[src]`; a block is always logged
+  prominently, an allowlisted pass is silent) →
+  unchanged-write **suppression** (`should_suppress`: same `(unit,reg,value)` within `HOLD`,
+  forced through every `REFRESH`; `SUPPRESS_EXCLUDE` — 47083 countdown — never suppressed) →
+  forward upstream. **Multi-register writes are never split/merged**: a client FC16 of N regs
+  is relayed as one FC16 of N regs (32-bit registers = 2 regs written atomically).
+- **FC gatekeeping**: 0x03/0x06/0x10 handled; 0x2B/0x41 relayed **verbatim** (the client does
+  any Huawei private 0x41 login crypto — the proxy performs no login and rewrites no value);
+  **0x17 (23) is rejected with 0x01 without consuming a queue slot**; any other FC → 0x01.
+- **Nothing is ever silently altered/clamped** — a disallowed write is denied and logged, an
+  allowed one passes through unchanged.
+- **Audit**: `record_audit` tracks every distinct `(src, unit, fc, reg)` — first/last seen,
+  count, distinct values, last result; `dump_audit` writes a TSV on **SIGHUP** and shutdown
+  (atomic `os.replace`). Muted sources (`READ_LOG_MUTE`, default HA) are still served and
+  audited, only their per-read INFO line is suppressed to keep the log control-focused.
 
-The `tests/` integration suite exercises this variant end-to-end: read-ahead warming,
-write-readback, JSON persistence, idle-close + on-demand reconnect, and the
-connection-limit value (proxy serves many clients while a direct client is refused).
+The `tests/` integration suite predates this rework and is **out of date** for the adaptive
+variant (it exercised the removed scheduler/idle-close and writes from loopback, which the
+ACL now denies by default). An in-process fake-dongle smoke test is the quick way to check
+this variant — it covers serialisation (max in-flight == 1), downstream-churn decoupling,
+ServerBusy retry, reconnect, ACL deny, high-risk block, suppression, 47083 exclusion, FC16
+atomic relay, FC-0x17 rejection, 0x41 relay, and the audit dump.

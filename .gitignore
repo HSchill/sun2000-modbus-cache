@@ -3,3 +3,5 @@ __pycache__/
 .env
 adaptive_cache_state.json
 adaptive_cache_state.json.tmp
+adaptive_cache.log
+register_audit.tsv
