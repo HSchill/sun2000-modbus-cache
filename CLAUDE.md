@@ -182,17 +182,28 @@ full env-var list):
   upstream connection. **Preserve it.**
 - **`keepalive_loop`** issues a no-op read (`KEEPALIVE_REG` on `KEEPALIVE_UNIT`) after
   `KEEPALIVE` idle seconds so the dongle doesn't silently close the socket between bursts.
-  **`health_loop`** logs a periodic health line (connected / degraded / consec-fail /
-  last-ok age / queue depth / suppressed-write count).
+  **`health_loop`** logs a periodic health line: connected / degraded / consec-fail /
+  last-ok age / **last transaction latency** / queue depth / suppressed-write count /
+  stale-read count / and a **failure-reason breakdown** (`fail_timeout` — no reply within
+  the per-attempt window, `fail_busy` — dongle replied ServerBusy, `fail_transport` —
+  connect/send/recv raised) so a degraded period's *dominant* failure mode is visible
+  without re-deriving it from raw logs. `Upstream.last_latency_ms` is set on every
+  successful transaction, so a systemic slowdown (successes getting slower, not just
+  failures) shows up too.
 - **`serve_read`** is a short-TTL (`READ_TTL`, default 2 s) read-through with
   concurrent-identical-read coalescing (`INFLIGHT`) — it exists to fold *near-simultaneous*
   reads of the same register from both clients into one round-trip, not to shield periodic
   polling. Writes invalidate the cached registers. **A failed upstream read falls back to the
   last-known cached value** (`result="stale"`) rather than failing the client outright — this
   always logs a `STALE` WARNING (bypassing `READ_LOG_MUTE`, since staleness is a health signal,
-  not routine poll chatter) and bumps `_stale_count`. This was previously silent: a chronically
-  failing register served hours-old data to a muted source (HA) with zero visibility in the
-  log — only a manual `SIGHUP` audit dump revealed it.
+  not routine poll chatter), names the **actual exception** that caused it (`reason=`, e.g.
+  `TxnTimeout`) and the queue depth at the time, and bumps `_stale_count`. This was previously
+  silent: a chronically failing register served hours-old data to a muted source (HA) with
+  zero visibility in the log — only a manual `SIGHUP` audit dump revealed it. Note a `stale`
+  serve is a *valid* Modbus response (old data, not an exception) — if a downstream client
+  (e.g. Home Assistant) still shows entities unavailable despite low `EXC` counts, suspect
+  its own client-side timeout firing before the proxy replies, not a proxy-side error; compare
+  `last_latency`/`fail_timeout` in the health line against that client's configured timeout.
 - **Write path** (`_do_write`), in order: deny-by-default per-source ACL (`WRITE_DENY` first,
   then `WRITE_ALLOW`; default `172.24.1.15`=Reduxi may write anything, `172.24.1.97`=HA
   none) → **high-risk gate** (`HIGH_RISK`, e.g. `47590==0` zeroing charge-from-grid, blocked

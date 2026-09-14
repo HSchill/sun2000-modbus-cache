@@ -310,6 +310,10 @@ class Upstream:
         self.consecutive_failures = 0
         self.last_success = 0.0
         self.degraded = False
+        self.last_latency_ms = 0.0
+        self.fail_timeout = 0      # no reply within the per-attempt window
+        self.fail_busy = 0         # dongle replied with EXC 0x06 ServerBusy
+        self.fail_transport = 0    # connect/send/recv raised (socket-level)
 
     @property
     def connected(self):
@@ -415,6 +419,7 @@ async def _do_transaction(pdu, unit, deadline):
     transaction deadline. Returns (body, attempts). Retries ServerBusy/timeout/reconnect;
     other Modbus exceptions and success are returned verbatim."""
     attempts = 0
+    txn_start = time.monotonic()
     while True:
         if time.monotonic() >= deadline:
             e = TxnTimeout()
@@ -427,6 +432,7 @@ async def _do_transaction(pdu, unit, deadline):
                 continue
             if not await UP.connect_once():
                 UP.note_fail()
+                UP.fail_transport += 1
                 UP._next_connect_at = time.monotonic() + UP.backoff
                 continue
             UP._next_connect_at = 0.0
@@ -441,6 +447,7 @@ async def _do_transaction(pdu, unit, deadline):
         except Exception as e:
             await UP.drop(f"send failed: {type(e).__name__}")
             UP.note_fail()
+            UP.fail_transport += 1
             continue
         UP.last_txn = time.monotonic()
 
@@ -450,21 +457,30 @@ async def _do_transaction(pdu, unit, deadline):
             body = await UP.read_frame(tx, timeout)
         except ReadTimeout:
             UP.note_fail()
+            UP.fail_timeout += 1
+            logger.debug(f"upstream no reply within {timeout:.1f}s (attempt {attempts}, "
+                         f"fc=0x{pdu[0]:02X} unit={unit})")
             await asyncio.sleep(min(UP.backoff, max(0.0, deadline - time.monotonic())))
             continue
         except Exception as e:
             await UP.drop(f"recv failed: {type(e).__name__}")
             UP.note_fail()
+            UP.fail_transport += 1
             continue
         UP.last_txn = time.monotonic()
 
         if len(body) >= 3 and body[1] >= 0x80 and body[2] == EXC_SERVER_BUSY:
             UP.note_fail()
+            UP.fail_busy += 1
             logger.debug(f"upstream ServerBusy, retry (attempt {attempts}, backoff {UP.backoff:.2f}s)")
             await asyncio.sleep(min(UP.backoff, max(0.0, deadline - time.monotonic())))
             continue
 
         UP.note_ok()
+        UP.last_latency_ms = (time.monotonic() - txn_start) * 1000
+        if attempts > 1:
+            logger.debug(f"upstream recovered after {attempts} attempts, "
+                         f"{UP.last_latency_ms:.0f}ms total (fc=0x{pdu[0]:02X} unit={unit})")
         return body, attempts
 
 
@@ -520,8 +536,11 @@ async def health_loop():
         age = (time.monotonic() - UP.last_success) if UP.last_success else -1
         logger.info(f"health: connected={UP.connected} degraded={UP.degraded} "
                     f"consec_fail={UP.consecutive_failures} last_ok={age:.0f}s "
+                    f"last_latency={UP.last_latency_ms:.0f}ms "
                     f"queue_depth={QUEUE.qsize()} suppressed_writes={_suppressed_count} "
-                    f"stale_reads={_stale_count}")
+                    f"stale_reads={_stale_count} "
+                    f"fail_timeout={UP.fail_timeout} fail_busy={UP.fail_busy} "
+                    f"fail_transport={UP.fail_transport}")
 
 
 # Upstream verbs (all go through the single worker)
@@ -599,6 +618,7 @@ async def serve_read(unit, start, count):
         needed = [start + i for i in range(count)
                   if not _fresh(CACHE.get((unit, start + i)), now)]
     result = "cache"
+    fail_reason = ""
     for s, c in _runs(needed, MAX_READ):
         try:
             values = await _fetch(unit, s, c)
@@ -609,8 +629,9 @@ async def serve_read(unit, start, count):
             result = "upstream"
         except ModbusException as e:
             raise CannotServe(e.code)
-        except Exception:
+        except Exception as e:
             result = "stale"
+            fail_reason = f"{type(e).__name__}: {e}" if str(e) else type(e).__name__
     async with CACHE_LOCK:
         out = []
         for i in range(count):
@@ -618,7 +639,7 @@ async def serve_read(unit, start, count):
             if ce is None:
                 raise CannotServe(EXC_GATEWAY_NO_RESPONSE)
             out.append(ce[0])
-    return out, result
+    return out, result, fail_reason
 
 
 # === Write suppression ===
@@ -735,8 +756,9 @@ async def _do_read(writer, src, tx_id, unit, pdu):
         _reply(writer, tx_id, unit, _exc_pdu(FC_READ, EXC_ILLEGAL_DATA_VALUE))
         return
     values = None
+    fail_reason = ""
     try:
-        values, result = await serve_read(unit, start, count)
+        values, result, fail_reason = await serve_read(unit, start, count)
         resp = struct.pack(">BB", FC_READ, count * 2) + struct.pack(">" + "H" * count, *values)
         _reply(writer, tx_id, unit, resp)
     except CannotServe as e:
@@ -750,6 +772,7 @@ async def _do_read(writer, src, tx_id, unit, pdu):
         global _stale_count
         _stale_count += 1
         logger.warning(f"STALE #{_stale_count} src={src} unit={unit} fc=0x03 reg={rng} "
+                       f"reason={fail_reason or 'unknown'} queue_depth={QUEUE.qsize()} "
                        f"(upstream read failed, served last-known cached value)")
     elif src not in READ_LOG_MUTE:      # noisy pollers (HA) are served + audited, not logged
         name, dec = decode_reg(start, values) if values else ("", "")
