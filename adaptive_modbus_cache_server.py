@@ -35,10 +35,12 @@ Config is env vars (below) plus the REGISTERS / ACL / HIGH_RISK tables near the 
     MIN_GAP             min seconds between upstream requests        (0.1)
     REQ_TIMEOUT         per-attempt response wait, s                 (3.0)
     WARMUP_TIMEOUT      first read after (re)connect waits up to, s  (14)
-    TXN_MAX             max s one transaction may hold the queue     (6)
-                        (kept small: a transaction that hasn't
-                        succeeded within this window is failed so it
-                        can't head-of-line-block every other client)
+    TXN_MAX             max s one transaction may hold the queue     (10)
+                        (bounds head-of-line blocking; raised from 6s
+                        after live data showed the dongle answering
+                        mostly ServerBusy - not silence - so 6s often
+                        wasn't enough runway to outlast a busy burst,
+                        pushing ~33% of reads to a stale cache serve)
     QUEUE_MAX_WAIT      max s a request may sit queued before being  (8)
                         failed without any upstream I/O (protects
                         against a deep backlog even with TXN_MAX capped)
@@ -75,7 +77,7 @@ READ_TTL = float(os.environ.get("READ_TTL", 2.0))
 MIN_GAP = float(os.environ.get("MIN_GAP", 0.1))
 REQ_TIMEOUT = float(os.environ.get("REQ_TIMEOUT", 3.0))
 WARMUP_TIMEOUT = float(os.environ.get("WARMUP_TIMEOUT", 14))
-TXN_MAX = float(os.environ.get("TXN_MAX", 6))
+TXN_MAX = float(os.environ.get("TXN_MAX", 10))
 QUEUE_MAX_WAIT = float(os.environ.get("QUEUE_MAX_WAIT", 8))
 CONNECT_TIMEOUT = float(os.environ.get("CONNECT_TIMEOUT", 8))
 BACKOFF_MIN = float(os.environ.get("BACKOFF_MIN", 0.1))

@@ -171,11 +171,15 @@ full env-var list):
   `TXN_MAX` (a per-transaction time cap so one bad register can't wedge the queue — it fails
   that op and moves on). Because the queue is strictly FIFO/single-worker, a chronically-slow
   or nonresponsive register **head-of-line-blocks every other client** for up to `TXN_MAX`;
-  keep `TXN_MAX` small (default 6 s, was 20 s — production evidence: a register the dongle
-  wouldn't answer caused a live HA read to hang 25+ s behind it). `QUEUE_MAX_WAIT` is a second
-  line of defence: an item that's already waited longer than that when dequeued is failed
-  immediately with **no upstream I/O**, so a backlog can't keep growing the worst case. The
-  worker logs per-txn queue wait/depth/attempts at DEBUG.
+  keep `TXN_MAX` small (default 10 s — originally 20 s, cut to 6 s after production evidence
+  that a register the dongle wouldn't answer caused a live HA read to hang 25+ s behind it;
+  raised back to 10 s after further live data showed the dongle mostly answering ServerBusy
+  rather than staying silent, so 6 s often wasn't enough runway to outlast a busy burst —
+  ~33% of reads were falling back to a stale cache serve). Tune with the health line's
+  `fail_busy`/`fail_timeout`/`stale_reads` counters as feedback, not blind guessing.
+  `QUEUE_MAX_WAIT` is a second line of defence: an item that's already waited longer than
+  that when dequeued is failed immediately with **no upstream I/O**, so a backlog can't keep
+  growing the worst case. The worker logs per-txn queue wait/depth/attempts at DEBUG.
 - **Downstream lifecycle is fully decoupled from upstream.** Clients (Reduxi/HA) cycle TCP
   sessions every few seconds; `handle_client` connect/disconnect never touches `Upstream`.
   This is the P0 invariant — a churn test proves 300 short-lived clients cause exactly one
