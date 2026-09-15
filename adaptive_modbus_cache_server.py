@@ -45,7 +45,13 @@ Config is env vars (below) plus the REGISTERS / ACL / HIGH_RISK tables near the 
                         failed without any upstream I/O (protects
                         against a deep backlog even with TXN_MAX capped)
     CONNECT_TIMEOUT     upstream connect timeout, s                  (8)
-    BACKOFF_MIN/MAX     exponential backoff bounds, s                (0.1 / 8)
+    BACKOFF_MIN/MAX     exponential backoff bounds, s                (0.1 / 2)
+                        (MAX lowered from 8: it's shared by the
+                        in-transaction retry backoff, and live data
+                        showed transactions idling a full 8s in one
+                        backoff sleep instead of retrying sooner -
+                        eating most of TXN_MAX without attempting
+                        anything)
     KEEPALIVE           idle seconds before a no-op read (0=off)     (20)
     HOLD / REFRESH      write-suppression window / force-through, s  (60 / 600)
     SUPPRESS_EXCLUDE    csv registers never suppressed               (47083)
@@ -81,7 +87,7 @@ TXN_MAX = float(os.environ.get("TXN_MAX", 10))
 QUEUE_MAX_WAIT = float(os.environ.get("QUEUE_MAX_WAIT", 8))
 CONNECT_TIMEOUT = float(os.environ.get("CONNECT_TIMEOUT", 8))
 BACKOFF_MIN = float(os.environ.get("BACKOFF_MIN", 0.1))
-BACKOFF_MAX = float(os.environ.get("BACKOFF_MAX", 8))
+BACKOFF_MAX = float(os.environ.get("BACKOFF_MAX", 2))
 KEEPALIVE = float(os.environ.get("KEEPALIVE", 20))
 KEEPALIVE_UNIT = int(os.environ.get("KEEPALIVE_UNIT", 1))
 KEEPALIVE_REG = int(os.environ.get("KEEPALIVE_REG", 30000))

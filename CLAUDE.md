@@ -159,10 +159,15 @@ full env-var list):
 
 - **`Upstream`** owns the *single persistent* TCP connection and is touched by **nothing but
   the worker** — so no lock is needed on the socket. `connect_once`/`drop` log every state
-  transition; `note_ok`/`note_fail` drive exponential backoff (`BACKOFF_MIN..MAX`) and a
-  `DEGRADED_THRESHOLD` consecutive-failure health flag. `warm` gives the first read after a
-  (re)connect a longer `WARMUP_TIMEOUT` (the dongle needs ~8–15 s to warm a fresh session —
-  see [[sdongle-requires-persistent-modbus-connection]]).
+  transition; `note_ok`/`note_fail` drive exponential backoff (`BACKOFF_MIN..MAX`, default
+  0.1s/2s) and a `DEGRADED_THRESHOLD` consecutive-failure health flag. The *same* backoff
+  value gates the in-transaction retry sleep in `_do_transaction`, not just reconnect
+  attempts — `BACKOFF_MAX` was cut from 8s to 2s after live latency data showed successful
+  transactions clustering at ~8.0s, i.e. spending most of `TXN_MAX`'s budget idly asleep in
+  one backoff step after escalating through a run of fast `ServerBusy` replies, rather than
+  attempting again sooner. `warm` gives the first read after a (re)connect a longer
+  `WARMUP_TIMEOUT` (the dongle needs ~8–15 s to warm a fresh session — see
+  [[sdongle-requires-persistent-modbus-connection]]).
 - **`QUEUE` + `upstream_worker`** are the heart: every read/write/relay is a `submit()` that
   enqueues one op and awaits a future. The single worker pulls FIFO and runs `_do_transaction`
   — so there is **exactly one upstream transaction in flight, ever**, regardless of how many
