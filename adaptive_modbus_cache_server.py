@@ -19,7 +19,9 @@ Design:
   * An idle keep-alive read stops the dongle silently closing the socket between bursts.
   * Deny-by-default per-source write ACL; FC 0x17 rejected without a queue slot; high-risk
     writes (47590==0) blocked unless explicitly allowlisted; unchanged writes suppressed
-    (except 47083); short-TTL read cache; nothing is ever altered/clamped — deny or pass.
+    (except 47083); a chronically flaky register (47112) gets shadow-acked instead of
+    resent once its current value has been tried once; short-TTL read cache; nothing is
+    ever altered/clamped — deny or pass.
   * Full audit: every request/response (fc, register, value, src, Modbus result), upstream
     connection-state transitions, per-transaction queue wait/depth, a periodic health line,
     and a register-audit table dumped on SIGHUP and shutdown.
@@ -55,6 +57,17 @@ Config is env vars (below) plus the REGISTERS / ACL / HIGH_RISK tables near the 
     KEEPALIVE           idle seconds before a no-op read (0=off)     (20)
     HOLD / REFRESH      write-suppression window / force-through, s  (60 / 600)
     SUPPRESS_EXCLUDE    csv registers never suppressed               (47083)
+    SHADOW_ACK_REGS     csv registers with shadow-ack write handling (47112)
+                        (47112: dongle sometimes silently drops it,
+                        sometimes rejects it with EXC 0x01, and Reduxi
+                        retries the SAME value every ~10s regardless -
+                        each silent retry occupies the whole queue for
+                        TXN_MAX, starving every other client. Once a
+                        value has been attempted upstream once (any
+                        outcome), a repeat of that exact value within
+                        HOLD/REFRESH is ACKed locally without ever
+                        touching the dongle. A genuinely new value
+                        always goes upstream.)
     HEALTH_INTERVAL     seconds between health log lines             (60)
     DEGRADED_THRESHOLD  consecutive failures -> "degraded"           (3)
     READ_LOG_MUTE       csv src IPs whose reads are served+audited   (172.24.1.97)
@@ -94,6 +107,7 @@ KEEPALIVE_REG = int(os.environ.get("KEEPALIVE_REG", 30000))
 HOLD = float(os.environ.get("HOLD", 60))
 REFRESH = float(os.environ.get("REFRESH", 600))
 SUPPRESS_EXCLUDE = {int(x) for x in os.environ.get("SUPPRESS_EXCLUDE", "47083").split(",") if x.strip()}
+SHADOW_ACK_REGS = {int(x) for x in os.environ.get("SHADOW_ACK_REGS", "47112").split(",") if x.strip()}
 HEALTH_INTERVAL = float(os.environ.get("HEALTH_INTERVAL", 60))
 DEGRADED_THRESHOLD = int(os.environ.get("DEGRADED_THRESHOLD", 3))
 READ_LOG_MUTE = {s for s in os.environ.get("READ_LOG_MUTE", "172.24.1.97").split(",") if s.strip()}
@@ -546,6 +560,7 @@ async def health_loop():
                     f"consec_fail={UP.consecutive_failures} last_ok={age:.0f}s "
                     f"last_latency={UP.last_latency_ms:.0f}ms "
                     f"queue_depth={QUEUE.qsize()} suppressed_writes={_suppressed_count} "
+                    f"shadow_acks={_shadow_ack_count} "
                     f"stale_reads={_stale_count} "
                     f"fail_timeout={UP.fail_timeout} fail_busy={UP.fail_busy} "
                     f"fail_transport={UP.fail_transport}")
@@ -660,6 +675,28 @@ def should_suppress(unit, start, count, vals, now):
     if any(start <= r < start + count for r in SUPPRESS_EXCLUDE):
         return False
     rec = LAST_WRITE.get((unit, start))
+    if rec is None or rec["count"] != count or rec["vals"] != vals:
+        return False
+    elapsed = now - rec["ts"]
+    if elapsed >= REFRESH:
+        return False
+    return elapsed < HOLD
+
+
+# === Shadow-ack for chronically flaky registers (e.g. 47112) ===
+# Unlike should_suppress (which requires a prior genuine upstream ACK as its baseline -
+# useless for a register that never actually succeeds), this tracks the last value
+# ATTEMPTED upstream regardless of outcome. A repeat of that same value is ACKed locally
+# without ever touching the dongle, so a client's own rapid retry loop against a register
+# the dongle periodically won't answer can't keep seizing the shared queue.
+SHADOW_WRITE = {}
+_shadow_ack_count = 0
+
+
+def should_shadow_ack(unit, start, count, vals, now):
+    if start not in SHADOW_ACK_REGS:
+        return False
+    rec = SHADOW_WRITE.get((unit, start))
     if rec is None or rec["count"] != count or rec["vals"] != vals:
         return False
     elapsed = now - rec["ts"]
@@ -839,6 +876,16 @@ async def _do_write(writer, src, tx_id, unit, fc, pdu):
         _reply(writer, tx_id, unit, echo)
         return
 
+    if should_shadow_ack(unit, start, count, tuple(raws), now):
+        global _shadow_ack_count
+        _shadow_ack_count += 1
+        logger.info(f"SHADOW-ACK #{_shadow_ack_count} src={src} unit={unit} reg={rng} "
+                    f"{name}={dec} (same value already attempted upstream recently, "
+                    f"not resent to dongle)")
+        record_audit(src, unit, fc, start, value, "shadow-ack")
+        _reply(writer, tx_id, unit, echo)
+        return
+
     try:
         if fc == FC_WRITE1:
             await up_write(unit, start, raws[0])
@@ -856,6 +903,12 @@ async def _do_write(writer, src, tx_id, unit, fc, pdu):
     except Exception as e:                      # TxnTimeout / cancelled / transport give-up
         result = f"FAIL {type(e).__name__}"
         _reply(writer, tx_id, unit, _exc_pdu(fc, EXC_DEVICE_FAILURE))
+    finally:
+        # Remember what we attempted upstream regardless of outcome, so a client's rapid
+        # retry of the SAME value against a chronically flaky register (see SHADOW_ACK_REGS)
+        # doesn't keep resending - one attempt is enough to have "tried".
+        if start in SHADOW_ACK_REGS:
+            SHADOW_WRITE[(unit, start)] = {"count": count, "vals": tuple(raws), "ts": now}
     logger.info(f"WRITE src={src} unit={unit} fc=0x{fc:02X} reg={rng} raw={_raw_str(raws)} "
                 f"{name}={dec} result={result}")
     record_audit(src, unit, fc, start, value, result)

@@ -220,8 +220,19 @@ full env-var list):
   prominently, an allowlisted pass is silent) →
   unchanged-write **suppression** (`should_suppress`: same `(unit,reg,value)` within `HOLD`,
   forced through every `REFRESH`; `SUPPRESS_EXCLUDE` — 47083 countdown — never suppressed) →
-  forward upstream. **Multi-register writes are never split/merged**: a client FC16 of N regs
+  **shadow-ack** (`should_shadow_ack`, `SHADOW_ACK_REGS` — default `{47112}`) → forward
+  upstream. **Multi-register writes are never split/merged**: a client FC16 of N regs
   is relayed as one FC16 of N regs (32-bit registers = 2 regs written atomically).
+- **Shadow-ack vs suppression**: `should_suppress` only fires once a write has *genuinely
+  succeeded* upstream (its baseline, `LAST_WRITE`, is set only on ACK) — useless for a
+  register that never actually succeeds. Register 47112 is exactly that case: live traffic
+  showed the dongle alternating between an immediate real `EXC 0x01 IllegalFunction` and
+  going fully silent on it, while Reduxi retries the same value every ~10s regardless. Each
+  silent retry burned the full `TXN_MAX` holding the single shared queue, starving every
+  other client. `SHADOW_WRITE` tracks the last value *attempted* upstream (any outcome —
+  ACK, exception, or timeout); a repeat of that exact value within `HOLD`/`REFRESH` is ACKed
+  locally and never sent to the dongle at all. A genuinely new value always goes upstream
+  for a fresh attempt. Audited as `shadow-ack`; counted in the health line's `shadow_acks`.
 - **FC gatekeeping**: 0x03/0x06/0x10 handled; 0x2B/0x41 relayed **verbatim** (the client does
   any Huawei private 0x41 login crypto — the proxy performs no login and rewrites no value);
   **0x17 (23) is rejected with 0x01 without consuming a queue slot**; any other FC → 0x01.
