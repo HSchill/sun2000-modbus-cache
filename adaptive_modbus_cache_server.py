@@ -40,18 +40,24 @@ Three behaviour changes to be aware of before deploying:
   2. Client reads are served from cache even when the cached value is old, rather than
      failing. Set CACHE_MAX_AGE to a number of seconds if you would rather a truly dead
      dongle surface as an error than as silently ageing data.
-  3. BG_CONFIRM_REGS (default 47416, "Maximum Feed Grid Power") gets a stronger version of
-     shadow-ack. Overnight data showed the dongle going silent on 89% of writes to this
-     register while Reduxi retried the same value every 10-20s for hours, each retry
-     monopolising the shared queue for the rest of TXN_MAX - the exact 47112 pattern, but
-     unlike 47112 this register DOES reach the device ~10% of the time, so faking success
-     outright (plain shadow-ack) risked a lasting mismatch between what the client was told
-     and what the inverter is actually enforcing. Instead: the first attempt is always tried
-     for real; if it fails, the client is ACKed immediately (so its own retry storm stops
-     hitting the queue) but a low-rate background task (BG_CONFIRM_INTERVAL apart, up to
-     BG_CONFIRM_MAX_ATTEMPTS) keeps trying the SAME value until it actually lands, and logs
-     loudly - at WARNING - whether it eventually landed or gave up. A genuinely new value
-     from the client always preempts a stale background attempt and is tried for real again.
+  3. BG_CONFIRM_REGS (default 47416 "Maximum Feed Grid Power", 40126 "Fixed active power
+     derated") gets a stronger version of shadow-ack. Live data showed the dongle going
+     silent on ~89% of writes to 47416 while Reduxi retried the same value every 10-20s for
+     hours, each retry monopolising the shared queue for the rest of TXN_MAX - the exact
+     47112 pattern, but unlike 47112 this register DOES reach the device ~10% of the time,
+     so faking success outright (plain shadow-ack) risked a lasting mismatch between what
+     the client was told and what the inverter is actually enforcing. Once 47416 stopped
+     monopolising the queue, 40126 - already showing the identical shape (same value,
+     ~89% TxnTimeout, ~6% landing) - immediately became the dominant failure instead, so it
+     got the same treatment. Watch for a THIRD register doing this next; it is the queue
+     itself surfacing whichever unconfirmed register currently has the most retry pressure,
+     not something specific to either of these two. Mechanism: the first attempt is always
+     tried for real; if it fails, the client is ACKed immediately (so its own retry storm
+     stops hitting the queue) but a low-rate background task (BG_CONFIRM_INTERVAL apart, up
+     to BG_CONFIRM_MAX_ATTEMPTS) keeps trying the SAME value until it actually lands, and
+     logs loudly - at WARNING - whether it eventually landed or gave up. A genuinely new
+     value from the client always preempts a stale background attempt and is tried for real
+     again.
 
 Function codes: 0x03 read, 0x06 write single, 0x10 write multiple, 0x2B device id (relayed),
 0x41 Huawei private/login (relayed verbatim - the client does the crypto). 0x17 is rejected.
@@ -98,9 +104,9 @@ Config is env vars (below) plus the REGISTERS / TTL / ACL tables near the top.
     HOLD / REFRESH      write-suppression window / force-through, s  (60 / 600)
     SUPPRESS_EXCLUDE    csv registers never suppressed               (47083)
     SHADOW_ACK_REGS     csv registers with shadow-ack write handling (47112)
-    CONFIRM_REGS        csv registers whose writes are retried       (40126,47590,47589)
+    CONFIRM_REGS        csv registers whose writes are retried       (47590,47589)
     WRITE_RETRIES       extra upstream attempts for CONFIRM_REGS     (2)
-    BG_CONFIRM_REGS     csv registers with background-confirm write (47416)
+    BG_CONFIRM_REGS     csv registers with background-confirm write (47416,40126)
                         handling (see below)
     BG_CONFIRM_INTERVAL seconds between background confirm retries   (5.0)
     BG_CONFIRM_MAX_ATTEMPTS  give up (and log loudly) after this many (30)
@@ -196,9 +202,9 @@ HOLD = float(os.environ.get("HOLD", 60))
 REFRESH = float(os.environ.get("REFRESH", 600))
 SUPPRESS_EXCLUDE = _env_csv_int("SUPPRESS_EXCLUDE", "47083")
 SHADOW_ACK_REGS = _env_csv_int("SHADOW_ACK_REGS", "47112")
-CONFIRM_REGS = _env_csv_int("CONFIRM_REGS", "40126,47590,47589")
+CONFIRM_REGS = _env_csv_int("CONFIRM_REGS", "47590,47589")
 WRITE_RETRIES = int(os.environ.get("WRITE_RETRIES", 2))
-BG_CONFIRM_REGS = _env_csv_int("BG_CONFIRM_REGS", "47416")
+BG_CONFIRM_REGS = _env_csv_int("BG_CONFIRM_REGS", "47416,40126")
 BG_CONFIRM_INTERVAL = float(os.environ.get("BG_CONFIRM_INTERVAL", 5.0))
 BG_CONFIRM_MAX_ATTEMPTS = int(os.environ.get("BG_CONFIRM_MAX_ATTEMPTS", 30))
 HIGH_RISK_REPLY = os.environ.get("HIGH_RISK_REPLY", "ack").strip().lower()
@@ -1261,7 +1267,7 @@ async def _attempt_write(unit, fc, start, raws):
 
 async def _do_bg_confirm_write(writer, tx_id, src, unit, fc, start, count, raws, value,
                                 name, dec, rng, echo):
-    """Write path for BG_CONFIRM_REGS (default 47416). Always tries for real first; a client
+    """Write path for BG_CONFIRM_REGS (default 47416, 40126). Always tries for real first; a client
     retry of the SAME value while a background attempt is still in flight (or has already
     landed) is answered immediately with no upstream I/O. A new value always preempts and is
     tried for real again. See the BG_CONFIRM section above for why this differs from
