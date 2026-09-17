@@ -40,24 +40,26 @@ Three behaviour changes to be aware of before deploying:
   2. Client reads are served from cache even when the cached value is old, rather than
      failing. Set CACHE_MAX_AGE to a number of seconds if you would rather a truly dead
      dongle surface as an error than as silently ageing data.
-  3. BG_CONFIRM_REGS (default 47416 "Maximum Feed Grid Power", 40126 "Fixed active power
-     derated") gets a stronger version of shadow-ack. Live data showed the dongle going
-     silent on ~89% of writes to 47416 while Reduxi retried the same value every 10-20s for
-     hours, each retry monopolising the shared queue for the rest of TXN_MAX - the exact
-     47112 pattern, but unlike 47112 this register DOES reach the device ~10% of the time,
-     so faking success outright (plain shadow-ack) risked a lasting mismatch between what
-     the client was told and what the inverter is actually enforcing. Once 47416 stopped
-     monopolising the queue, 40126 - already showing the identical shape (same value,
-     ~89% TxnTimeout, ~6% landing) - immediately became the dominant failure instead, so it
-     got the same treatment. Watch for a THIRD register doing this next; it is the queue
-     itself surfacing whichever unconfirmed register currently has the most retry pressure,
-     not something specific to either of these two. Mechanism: the first attempt is always
-     tried for real; if it fails, the client is ACKed immediately (so its own retry storm
-     stops hitting the queue) but a low-rate background task (BG_CONFIRM_INTERVAL apart, up
-     to BG_CONFIRM_MAX_ATTEMPTS) keeps trying the SAME value until it actually lands, and
-     logs loudly - at WARNING - whether it eventually landed or gave up. A genuinely new
-     value from the client always preempts a stale background attempt and is tried for real
-     again.
+  3. Background-confirm (BG_CONFIRM_ALL=1, the default) is now the standard write path for
+     essentially every write, not an allowlisted special case. It started as a targeted fix
+     for 47416 ("Maximum Feed Grid Power"): live data showed the dongle going silent on
+     ~89% of writes to it while Reduxi retried the same value every 10-20s for hours, each
+     retry monopolising the shared queue for the rest of TXN_MAX. Fixing that register made
+     40126 ("Fixed active power derated") - already showing the identical shape - become
+     the dominant failure instead within hours, and 47590/47415 were next in line: this
+     turned out to be a property of the QUEUE (an unconfirmed retry storm on ANY register
+     starves everyone else), not something specific to any one register, so treating it as
+     an opt-in allowlist was chasing the same problem one register at a time. It is now the
+     default for every write except SHADOW_ACK_REGS (47112 - mostly rejected outright by the
+     device, so plain shadow-ack is cheap and sufficient) and SUPPRESS_EXCLUDE (47083 - a
+     countdown pulse that must always get a fresh, real attempt). Set BG_CONFIRM_ALL=0 to
+     fall back to the narrower BG_CONFIRM_REGS allowlist instead. Mechanism: the first
+     attempt is always tried for real; if it fails, the client is ACKed immediately (so its
+     own retry storm stops hitting the queue) but a low-rate background task
+     (BG_CONFIRM_INTERVAL apart, up to BG_CONFIRM_MAX_ATTEMPTS) keeps trying the SAME value
+     until it actually lands, and logs loudly - at WARNING - whether it eventually landed or
+     gave up. A genuinely new value from the client always preempts a stale background
+     attempt and is tried for real again.
 
 Function codes: 0x03 read, 0x06 write single, 0x10 write multiple, 0x2B device id (relayed),
 0x41 Huawei private/login (relayed verbatim - the client does the crypto). 0x17 is rejected.
@@ -104,10 +106,15 @@ Config is env vars (below) plus the REGISTERS / TTL / ACL tables near the top.
     HOLD / REFRESH      write-suppression window / force-through, s  (60 / 600)
     SUPPRESS_EXCLUDE    csv registers never suppressed               (47083)
     SHADOW_ACK_REGS     csv registers with shadow-ack write handling (47112)
-    CONFIRM_REGS        csv registers whose writes are retried       (47590,47589)
+    CONFIRM_REGS        csv registers whose writes get extra sync    (47590,47589)
+                        retries instead of BG_CONFIRM - only used if
+                        BG_CONFIRM_ALL=0
     WRITE_RETRIES       extra upstream attempts for CONFIRM_REGS     (2)
+    BG_CONFIRM_ALL      background-confirm every write not in        (1)
+                        SHADOW_ACK_REGS/SUPPRESS_EXCLUDE (1/0) - the
+                        default write-reliability strategy (see below)
     BG_CONFIRM_REGS     csv registers with background-confirm write (47416,40126)
-                        handling (see below)
+                        handling when BG_CONFIRM_ALL=0
     BG_CONFIRM_INTERVAL seconds between background confirm retries   (5.0)
     BG_CONFIRM_MAX_ATTEMPTS  give up (and log loudly) after this many (30)
                         background attempts for one value
@@ -202,9 +209,10 @@ HOLD = float(os.environ.get("HOLD", 60))
 REFRESH = float(os.environ.get("REFRESH", 600))
 SUPPRESS_EXCLUDE = _env_csv_int("SUPPRESS_EXCLUDE", "47083")
 SHADOW_ACK_REGS = _env_csv_int("SHADOW_ACK_REGS", "47112")
-CONFIRM_REGS = _env_csv_int("CONFIRM_REGS", "47590,47589")
+CONFIRM_REGS = _env_csv_int("CONFIRM_REGS", "47590,47589")   # only consulted if BG_CONFIRM_ALL=0
 WRITE_RETRIES = int(os.environ.get("WRITE_RETRIES", 2))
-BG_CONFIRM_REGS = _env_csv_int("BG_CONFIRM_REGS", "47416,40126")
+BG_CONFIRM_ALL = _env_flag("BG_CONFIRM_ALL", True)
+BG_CONFIRM_REGS = _env_csv_int("BG_CONFIRM_REGS", "47416,40126")   # only consulted if BG_CONFIRM_ALL=0
 BG_CONFIRM_INTERVAL = float(os.environ.get("BG_CONFIRM_INTERVAL", 5.0))
 BG_CONFIRM_MAX_ATTEMPTS = int(os.environ.get("BG_CONFIRM_MAX_ATTEMPTS", 30))
 HIGH_RISK_REPLY = os.environ.get("HIGH_RISK_REPLY", "ack").strip().lower()
@@ -315,6 +323,7 @@ C = Counters()
 _n_read_log = itertools.count()
 _n_stale_log = itertools.count()
 _n_blocked_log = itertools.count()
+_n_bgconfirm_log = itertools.count()
 
 
 def _every_n(counter):
@@ -1265,9 +1274,26 @@ async def _attempt_write(unit, fc, start, raws):
         await up_write_multiple(unit, start, raws)
 
 
+def _use_bg_confirm(start):
+    # SHADOW_ACK_REGS and SUPPRESS_EXCLUDE already have their own, more specific handling -
+    # 47112-style registers are mostly rejected outright by the device (low stakes to fake
+    # success), and SUPPRESS_EXCLUDE (47083, a countdown pulse) must always get a fresh, real,
+    # synchronous attempt so a repeated pulse isn't mistaken for "already chasing this value".
+    # Every other write defaults to background-confirm (BG_CONFIRM_ALL=1): three registers in
+    # a row (47112 -> 47416 -> 40126 -> ...) turned out to have the identical shape - a real
+    # setpoint the client retries unchanged for hours while the dongle answers busy/silent
+    # most of the time - so treating it as the exception rather than the rule was chasing the
+    # queue-starvation problem one register at a time instead of fixing it. Set
+    # BG_CONFIRM_ALL=0 to go back to only the explicit BG_CONFIRM_REGS allowlist.
+    if start in SHADOW_ACK_REGS or start in SUPPRESS_EXCLUDE:
+        return False
+    return True if BG_CONFIRM_ALL else start in BG_CONFIRM_REGS
+
+
 async def _do_bg_confirm_write(writer, tx_id, src, unit, fc, start, count, raws, value,
                                 name, dec, rng, echo):
-    """Write path for BG_CONFIRM_REGS (default 47416, 40126). Always tries for real first; a client
+    """Default write path (BG_CONFIRM_ALL=1) for anything not handled by should_shadow_ack or
+    SUPPRESS_EXCLUDE - see _use_bg_confirm. Always tries for real first; a client
     retry of the SAME value while a background attempt is still in flight (or has already
     landed) is answered immediately with no upstream I/O. A new value always preempts and is
     tried for real again. See the BG_CONFIRM section above for why this differs from
@@ -1280,7 +1306,7 @@ async def _do_bg_confirm_write(writer, tx_id, src, unit, fc, start, count, raws,
         # Either still being chased in the background, or already landed - either way the
         # client doesn't need to resend it, and resending would just restart the chase.
         C.shadow_acks += 1
-        if LOG_WRITES:
+        if LOG_WRITES and _every_n(_n_bgconfirm_log):
             status = "already landed" if rec["landed"] else "still retrying in the background"
             logger.info(f"BG-CONFIRM shadow-ack src={src} unit={unit} reg={rng} {name}={dec} "
                         f"({status})")
@@ -1405,7 +1431,7 @@ async def _do_write(writer, src, tx_id, unit, fc, pdu):
         _reply(writer, tx_id, unit, echo)
         return
 
-    if start in BG_CONFIRM_REGS:
+    if _use_bg_confirm(start):
         await _do_bg_confirm_write(writer, tx_id, src, unit, fc, start, count, raws, value,
                                     name, dec, rng, echo)
         return
@@ -1490,9 +1516,9 @@ def _banner():
             f"client-read-cap {CLIENT_READ_MAX_WAIT:g}s, "
             f"max-age {CACHE_MAX_AGE:g}s{' (unlimited)' if CACHE_MAX_AGE <= 0 else ''}\n"
             f"  writes: suppress {HOLD:g}/{REFRESH:g}s, shadow-ack {sorted(SHADOW_ACK_REGS)}, "
-            f"confirm {sorted(CONFIRM_REGS)} x{WRITE_RETRIES} retries, "
-            f"bg-confirm {sorted(BG_CONFIRM_REGS)} every {BG_CONFIRM_INTERVAL:g}s "
-            f"x{BG_CONFIRM_MAX_ATTEMPTS}, "
+            f"bg-confirm {'ALL (except shadow-ack/suppress-exclude)' if BG_CONFIRM_ALL else sorted(BG_CONFIRM_REGS)} "
+            f"every {BG_CONFIRM_INTERVAL:g}s x{BG_CONFIRM_MAX_ATTEMPTS}"
+            f"{f', confirm {sorted(CONFIRM_REGS)} x{WRITE_RETRIES} retries' if not BG_CONFIRM_ALL else ''}, "
             f"high-risk reply={HIGH_RISK_REPLY}, deny reply={DENY_REPLY}\n"
             f"  logging: console {'on' if LOG_CONSOLE else 'OFF'}, "
             f"file {LOG_FILE or 'OFF'}"
