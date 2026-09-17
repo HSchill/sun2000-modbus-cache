@@ -220,8 +220,9 @@ full env-var list):
   prominently, an allowlisted pass is silent) →
   unchanged-write **suppression** (`should_suppress`: same `(unit,reg,value)` within `HOLD`,
   forced through every `REFRESH`; `SUPPRESS_EXCLUDE` — 47083 countdown — never suppressed) →
-  **shadow-ack** (`should_shadow_ack`, `SHADOW_ACK_REGS` — default `{47112}`) → forward
-  upstream. **Multi-register writes are never split/merged**: a client FC16 of N regs
+  **shadow-ack** (`should_shadow_ack`, `SHADOW_ACK_REGS` — default `{47112}`) →
+  **background-confirm** (`_do_bg_confirm_write`, `BG_CONFIRM_REGS` — default `{47416}`) →
+  forward upstream. **Multi-register writes are never split/merged**: a client FC16 of N regs
   is relayed as one FC16 of N regs (32-bit registers = 2 regs written atomically).
 - **Shadow-ack vs suppression**: `should_suppress` only fires once a write has *genuinely
   succeeded* upstream (its baseline, `LAST_WRITE`, is set only on ACK) — useless for a
@@ -233,6 +234,24 @@ full env-var list):
   ACK, exception, or timeout); a repeat of that exact value within `HOLD`/`REFRESH` is ACKed
   locally and never sent to the dongle at all. A genuinely new value always goes upstream
   for a fresh attempt. Audited as `shadow-ack`; counted in the health line's `shadow_acks`.
+- **Background-confirm (47416) vs plain shadow-ack**: plain shadow-ack is only safe when a
+  failed write has no real consequence, which is true for 47112 (mostly rejected outright by
+  the device) but not for 47416 ("Maximum Feed Grid Power") — a 39h overnight sample showed
+  the dongle going silent on 89% of writes to it while Reduxi retried the identical value
+  every 10–20s for hours, each retry monopolising the shared queue exactly like 47112 — but
+  **10% of attempts genuinely land**, so faking success outright would risk a lasting
+  mismatch between what the client was told and what the inverter actually enforces (a real
+  concern for a power/export-limit register). `_do_bg_confirm_write` always tries a new value
+  for real first; if it fails, the client is ACKed immediately (stopping its own retry storm
+  from hitting the queue) but `_bg_confirm_loop` keeps retrying that exact value in the
+  background — `BG_CONFIRM_INTERVAL` apart, up to `BG_CONFIRM_MAX_ATTEMPTS` — until it lands
+  or gives up, logging a `BG-CONFIRM landed`/`BG-CONFIRM GAVE UP` WARNING either way so a
+  mismatch is never silent. A genuinely new value from the client always preempts a stale
+  background attempt (the loop checks `BG_CONFIRM[key]["vals"]` each cycle and quietly
+  abandons itself if superseded) and gets a fresh real attempt. `BG_CONFIRM_TASKS` holds a
+  strong reference to each background task until it's done — the same "task exception was
+  never retrieved" GC hazard as `BG_FETCHES`/`_bg_done` (see `serve_read`) applies here too if
+  that set is ever removed.
 - **FC gatekeeping**: 0x03/0x06/0x10 handled; 0x2B/0x41 relayed **verbatim** (the client does
   any Huawei private 0x41 login crypto — the proxy performs no login and rewrites no value);
   **0x17 (23) is rejected with 0x01 without consuming a queue slot**; any other FC → 0x01.

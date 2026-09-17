@@ -1,90 +1,168 @@
 #!/usr/bin/env python3
-"""Serialising Modbus-TCP proxy hardening a Huawei SUN2000 SDongle for shared use.
+"""Decoupling Modbus-TCP proxy hardening a Huawei SUN2000 SDongle for shared use.
 
 The SDongle accepts exactly ONE Modbus TCP client and one in-flight transaction at a time,
-is slow, and drops idle/over-driven connections. Reduxi (172.24.1.15, writes) and Home
-Assistant (172.24.1.97, reads) both need it. When the link wobbles, Reduxi loses battery
-telemetry, trips its safety fallback and reverts the inverters to self-consumption — so the
-whole job of this proxy is to present a rock-solid link to both clients.
+is slow, and is frequently "too busy to answer" (it replies EXC 0x06 ServerBusy far more
+often than it goes silent, and essentially never drops TCP). Reduxi (172.24.1.15, EMS
+control writes) and Home Assistant (172.24.1.97, read-only telemetry) both need it.
 
-Design:
-  * ONE persistent upstream connection, its lifecycle fully DECOUPLED from downstream client
-    sockets (clients may cycle TCP sessions every few seconds; the upstream never reconnects
-    because of that). Reconnect uses exponential backoff; every drop/reconnect is logged.
-  * A single FIFO queue + one worker owns the socket, so there is exactly one upstream request
-    in flight, ever — no concurrency, no per-client races. Downstream reads/writes/relays all
-    funnel through it.
-  * Per-request min-gap; a per-transaction total-time cap so one bad register can't wedge the
-    queue; retry-with-backoff on ServerBusy(0x06)/timeout; reconnect on transport error.
-  * An idle keep-alive read stops the dongle silently closing the socket between bursts.
-  * Deny-by-default per-source write ACL; FC 0x17 rejected without a queue slot; high-risk
-    writes (47590==0) blocked unless explicitly allowlisted; unchanged writes suppressed
-    (except 47083); a chronically flaky register (47112) gets shadow-acked instead of
-    resent once its current value has been tried once; short-TTL read cache; nothing is
-    ever altered/clamped — deny or pass.
-  * Full audit: every request/response (fc, register, value, src, Modbus result), upstream
-    connection-state transitions, per-transaction queue wait/depth, a periodic health line,
-    and a register-audit table dumped on SIGHUP and shutdown.
+WHAT CHANGED IN THIS REVISION (and why)
+---------------------------------------
+Measured over 39h of the previous "serialising" revision: 18,757 stale serves, 4,319
+queue-wait drops, Reduxi in Communication-error ~55% of the time, and 58% of all client
+reads were register 32000 which returned the identical value 23,100 times out of 23,209.
+Tuning TXN_MAX/BACKOFF_MAX across four sessions moved none of the headline numbers, because
+none of them changed how much is ASKED of the dongle.
+
+So the design is inverted:
+
+  * DECOUPLED, not just serialised. A background POLLER owns the dongle and refreshes a
+    learned register plan at a fixed rate the dongle can actually sustain. Client reads are
+    answered from cache IMMEDIATELY and unconditionally - never queued behind the dongle,
+    never failed because the dongle is busy. Dongle health no longer maps onto client-visible
+    latency, which is what made HA go "unavailable" and Reduxi raise Communication error.
+  * PER-REGISTER cache lifetimes instead of one flat TTL. A rating register polled hourly and
+    a battery power register polled every 5s no longer cost the same.
+  * WRITES keep the queue and take priority over polling - they are the only traffic that
+    genuinely must reach the device - and critical registers are retried before failing.
+
+Everything the previous revision got right is kept: one persistent upstream connection whose
+lifecycle is fully decoupled from downstream client sockets; exactly one upstream transaction
+in flight; per-request min-gap; per-transaction time cap; retry/backoff on ServerBusy;
+deny-by-default write ACL; FC 0x17 rejected; unchanged-write suppression (except 47083);
+shadow-ack for chronically flaky registers; full register audit.
+
+Three behaviour changes to be aware of before deploying:
+  1. HIGH_RISK_REPLY defaults to "ack" (see below). The previous revision answered a blocked
+     high-risk write with EXC 0x01 IllegalFunction - 44,041 times in 39h - which a control
+     system quite reasonably reads as a device fault. Blocking the write is still right; the
+     hard exception was not. Set HIGH_RISK_REPLY=exception to restore the old behaviour.
+  2. Client reads are served from cache even when the cached value is old, rather than
+     failing. Set CACHE_MAX_AGE to a number of seconds if you would rather a truly dead
+     dongle surface as an error than as silently ageing data.
+  3. BG_CONFIRM_REGS (default 47416, "Maximum Feed Grid Power") gets a stronger version of
+     shadow-ack. Overnight data showed the dongle going silent on 89% of writes to this
+     register while Reduxi retried the same value every 10-20s for hours, each retry
+     monopolising the shared queue for the rest of TXN_MAX - the exact 47112 pattern, but
+     unlike 47112 this register DOES reach the device ~10% of the time, so faking success
+     outright (plain shadow-ack) risked a lasting mismatch between what the client was told
+     and what the inverter is actually enforcing. Instead: the first attempt is always tried
+     for real; if it fails, the client is ACKed immediately (so its own retry storm stops
+     hitting the queue) but a low-rate background task (BG_CONFIRM_INTERVAL apart, up to
+     BG_CONFIRM_MAX_ATTEMPTS) keeps trying the SAME value until it actually lands, and logs
+     loudly - at WARNING - whether it eventually landed or gave up. A genuinely new value
+     from the client always preempts a stale background attempt and is tried for real again.
 
 Function codes: 0x03 read, 0x06 write single, 0x10 write multiple, 0x2B device id (relayed),
-0x41 Huawei private/login (relayed verbatim — the client does the crypto). 0x17 is rejected.
+0x41 Huawei private/login (relayed verbatim - the client does the crypto). 0x17 is rejected.
 
-Config is env vars (below) plus the REGISTERS / ACL / HIGH_RISK tables near the top.
+Config is env vars (below) plus the REGISTERS / TTL / ACL tables near the top.
 
+  CONNECTION
     SUN2000_HOST/PORT   dongle address / port (172.24.7.128 / 502)   (HOST required)
     LISTEN_HOST/PORT    where to serve                               (0.0.0.0 / 5502)
-    READ_TTL            read-cache freshness, s                      (2.0)
-    MIN_GAP             min seconds between upstream requests        (0.1)
+    CONNECT_TIMEOUT     upstream connect timeout, s                  (8)
     REQ_TIMEOUT         per-attempt response wait, s                 (3.0)
     WARMUP_TIMEOUT      first read after (re)connect waits up to, s  (14)
-    TXN_MAX             max s one transaction may hold the queue     (10)
-                        (bounds head-of-line blocking; raised from 6s
-                        after live data showed the dongle answering
-                        mostly ServerBusy - not silence - so 6s often
-                        wasn't enough runway to outlast a busy burst,
-                        pushing ~33% of reads to a stale cache serve)
-    QUEUE_MAX_WAIT      max s a request may sit queued before being  (8)
-                        failed without any upstream I/O (protects
-                        against a deep backlog even with TXN_MAX capped)
-    CONNECT_TIMEOUT     upstream connect timeout, s                  (8)
+    MIN_GAP             min seconds between upstream requests        (0.25)
     BACKOFF_MIN/MAX     exponential backoff bounds, s                (0.1 / 2)
-                        (MAX lowered from 8: it's shared by the
-                        in-transaction retry backoff, and live data
-                        showed transactions idling a full 8s in one
-                        backoff sleep instead of retrying sooner -
-                        eating most of TXN_MAX without attempting
-                        anything)
     KEEPALIVE           idle seconds before a no-op read (0=off)     (20)
+                        (redundant when the poller is on; kept for POLL_ENABLE=0)
+
+  SCHEDULING
+    TXN_MAX             max s one transaction may hold the queue     (10)
+    QUEUE_MAX_WAIT      max s a request may sit queued before being  (8)
+                        failed without any upstream I/O
+    POLL_ENABLE         run the background poller (1/0)              (1)
+    POLL_INTERVAL       seconds between poller transactions          (0.5)
+                        (the dongle's sustainable rate - raise this
+                        until fail_busy collapses; 0.5 = 2 txn/s)
+    POLL_MAX_RUN        max registers coalesced into one poll read   (64)
+    POLL_BACKLOG_PAUSE  pause polling while the queue is deeper than (8)
+    DEMAND_TTL          stop polling a register nobody has asked     (900)
+                        for in this many seconds
+    SERVE_FROM_CACHE    answer client reads from cache without ever  (1)
+                        blocking on the dongle (1/0)
+    CLIENT_READ_MAX_WAIT  hard cap on how long a client read may     (3.0)
+                        block when it asks for a register we have
+                        never read (the only blocking case left).
+                        On expiry the client gets an exception and
+                        the register is left to the poller, so the
+                        next read is served from cache.
+    CACHE_MAX_AGE       refuse to serve a value older than this, s   (0 = never refuse)
+    READ_TTL            default cache lifetime, s (per-register      (5.0)
+                        values in REG_TTL / TTL_RANGES override it)
+    REG_TTL_OVERRIDES   csv reg:seconds, e.g. "32000:30,30071:3600"  ("")
+
+  WRITES
     HOLD / REFRESH      write-suppression window / force-through, s  (60 / 600)
     SUPPRESS_EXCLUDE    csv registers never suppressed               (47083)
     SHADOW_ACK_REGS     csv registers with shadow-ack write handling (47112)
-                        (47112: dongle sometimes silently drops it,
-                        sometimes rejects it with EXC 0x01, and Reduxi
-                        retries the SAME value every ~10s regardless -
-                        each silent retry occupies the whole queue for
-                        TXN_MAX, starving every other client. Once a
-                        value has been attempted upstream once (any
-                        outcome), a repeat of that exact value within
-                        HOLD/REFRESH is ACKed locally without ever
-                        touching the dongle. A genuinely new value
-                        always goes upstream.)
-    HEALTH_INTERVAL     seconds between health log lines             (60)
-    DEGRADED_THRESHOLD  consecutive failures -> "degraded"           (3)
+    CONFIRM_REGS        csv registers whose writes are retried       (40126,47590,47589)
+    WRITE_RETRIES       extra upstream attempts for CONFIRM_REGS     (2)
+    BG_CONFIRM_REGS     csv registers with background-confirm write (47416)
+                        handling (see below)
+    BG_CONFIRM_INTERVAL seconds between background confirm retries   (5.0)
+    BG_CONFIRM_MAX_ATTEMPTS  give up (and log loudly) after this many (30)
+                        background attempts for one value
+    HIGH_RISK_REPLY     ack | exception - what a blocked high-risk   (ack)
+                        write is answered with
+    DENY_REPLY          ack | exception - same, for ACL denials      (exception)
+    ACL_ALLOW_SRC       csv extra source IPs allowed to write        ("")
+
+  LOGGING  (all of it switchable - see LOG_QUIET for the big hammer)
+    LOG_LEVEL           INFO / DEBUG / WARNING                       (INFO)
+    LOG_CONSOLE         write to console at all (1/0)                (1)
+    LOG_FILE            also append here ("" = no file)              (adaptive_cache.log)
+    LOG_FILE_MAX_MB     rotate the file at this size (0 = no rotate) (32)
+    LOG_FILE_BACKUPS    how many rotated files to keep               (3)
+    LOG_QUIET           1 = turn off all per-event chatter (reads,   (0)
+                        writes, stale, blocked, connects, degraded)
+                        and keep only health/summary + warnings
+    LOG_READS           per-read lines (1/0)                         (1)
+    LOG_WRITES          per-write lines (1/0)                        (1)
+    LOG_RELAY           per-relay lines (1/0)                        (1)
+    LOG_STALE           stale-serve lines (1/0)                      (1)
+    LOG_BLOCKED         blocked/denied write lines (1/0)             (1)
+    LOG_CONN            client connect/disconnect lines (1/0)        (1)
+    LOG_DEGRADED        upstream DEGRADED/RECOVERED lines (1/0)      (1)
+    LOG_POLL            per-poll-transaction lines (1/0)             (0)
+    LOG_HEALTH          periodic health line (1/0)                   (1)
+    LOG_SUMMARY         periodic rolled-up counts of whatever the    (1)
+                        per-event switches above are hiding
+    LOG_EVERY_N         log only every Nth of the high-volume        (1)
+                        categories (reads/stale/blocked); 0 = never
     READ_LOG_MUTE       csv src IPs whose reads are served+audited   (172.24.1.97)
                         but not logged per-read
+    HEALTH_INTERVAL     seconds between health/summary lines         (60)
+    DEGRADED_THRESHOLD  consecutive failures -> "degraded"           (3)
     AUDIT_FILE          register-audit dump path                     (register_audit.tsv)
-    LOG_FILE            console output is also appended here         (adaptive_cache.log)
-                        ("" disables the file copy)
-    LOG_LEVEL           INFO / DEBUG / WARNING                       (INFO)
+
+Whatever the switches say, anything that indicates a real problem (connect failures, upstream
+drops, audit-dump failures, client errors) is always logged.
 """
 
 import asyncio
+import itertools
 import logging
+import logging.handlers
 import os
 import signal
 import struct
 import sys
 import time
+
+
+def _env_flag(name, default):
+    v = os.environ.get(name)
+    if v is None:
+        return bool(default)
+    return v.strip().lower() not in ("", "0", "false", "no", "off")
+
+
+def _env_csv_int(name, default):
+    return {int(x) for x in os.environ.get(name, default).split(",") if x.strip()}
+
 
 # === Configuration ===
 DONGLE_HOST = os.environ.get("SUN2000_HOST")
@@ -92,8 +170,8 @@ DONGLE_PORT = int(os.environ.get("SUN2000_PORT", 502))
 SERVER_HOST = os.environ.get("LISTEN_HOST", "0.0.0.0")
 SERVER_PORT = int(os.environ.get("LISTEN_PORT", 5502))
 
-READ_TTL = float(os.environ.get("READ_TTL", 2.0))
-MIN_GAP = float(os.environ.get("MIN_GAP", 0.1))
+READ_TTL = float(os.environ.get("READ_TTL", 5.0))
+MIN_GAP = float(os.environ.get("MIN_GAP", 0.25))
 REQ_TIMEOUT = float(os.environ.get("REQ_TIMEOUT", 3.0))
 WARMUP_TIMEOUT = float(os.environ.get("WARMUP_TIMEOUT", 14))
 TXN_MAX = float(os.environ.get("TXN_MAX", 10))
@@ -104,58 +182,141 @@ BACKOFF_MAX = float(os.environ.get("BACKOFF_MAX", 2))
 KEEPALIVE = float(os.environ.get("KEEPALIVE", 20))
 KEEPALIVE_UNIT = int(os.environ.get("KEEPALIVE_UNIT", 1))
 KEEPALIVE_REG = int(os.environ.get("KEEPALIVE_REG", 30000))
+
+POLL_ENABLE = _env_flag("POLL_ENABLE", True)
+POLL_INTERVAL = float(os.environ.get("POLL_INTERVAL", 0.5))
+POLL_MAX_RUN = int(os.environ.get("POLL_MAX_RUN", 64))
+POLL_BACKLOG_PAUSE = int(os.environ.get("POLL_BACKLOG_PAUSE", 8))
+DEMAND_TTL = float(os.environ.get("DEMAND_TTL", 900))
+SERVE_FROM_CACHE = _env_flag("SERVE_FROM_CACHE", True)
+CACHE_MAX_AGE = float(os.environ.get("CACHE_MAX_AGE", 0))
+CLIENT_READ_MAX_WAIT = float(os.environ.get("CLIENT_READ_MAX_WAIT", 3.0))
+
 HOLD = float(os.environ.get("HOLD", 60))
 REFRESH = float(os.environ.get("REFRESH", 600))
-SUPPRESS_EXCLUDE = {int(x) for x in os.environ.get("SUPPRESS_EXCLUDE", "47083").split(",") if x.strip()}
-SHADOW_ACK_REGS = {int(x) for x in os.environ.get("SHADOW_ACK_REGS", "47112").split(",") if x.strip()}
+SUPPRESS_EXCLUDE = _env_csv_int("SUPPRESS_EXCLUDE", "47083")
+SHADOW_ACK_REGS = _env_csv_int("SHADOW_ACK_REGS", "47112")
+CONFIRM_REGS = _env_csv_int("CONFIRM_REGS", "40126,47590,47589")
+WRITE_RETRIES = int(os.environ.get("WRITE_RETRIES", 2))
+BG_CONFIRM_REGS = _env_csv_int("BG_CONFIRM_REGS", "47416")
+BG_CONFIRM_INTERVAL = float(os.environ.get("BG_CONFIRM_INTERVAL", 5.0))
+BG_CONFIRM_MAX_ATTEMPTS = int(os.environ.get("BG_CONFIRM_MAX_ATTEMPTS", 30))
+HIGH_RISK_REPLY = os.environ.get("HIGH_RISK_REPLY", "ack").strip().lower()
+DENY_REPLY = os.environ.get("DENY_REPLY", "exception").strip().lower()
+
 HEALTH_INTERVAL = float(os.environ.get("HEALTH_INTERVAL", 60))
 DEGRADED_THRESHOLD = int(os.environ.get("DEGRADED_THRESHOLD", 3))
 READ_LOG_MUTE = {s for s in os.environ.get("READ_LOG_MUTE", "172.24.1.97").split(",") if s.strip()}
 AUDIT_FILE = os.environ.get("AUDIT_FILE", "register_audit.tsv")
 CLIENT_IDLE_TIMEOUT = float(os.environ.get("CLIENT_IDLE_TIMEOUT", 300))
+
+# --- logging switches ---
+LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO")
+LOG_CONSOLE = _env_flag("LOG_CONSOLE", True)
 LOG_FILE = os.environ.get("LOG_FILE", "adaptive_cache.log")
+LOG_FILE_MAX_MB = float(os.environ.get("LOG_FILE_MAX_MB", 32))
+LOG_FILE_BACKUPS = int(os.environ.get("LOG_FILE_BACKUPS", 3))
+LOG_QUIET = _env_flag("LOG_QUIET", False)
+LOG_EVERY_N = int(os.environ.get("LOG_EVERY_N", 1))
+LOG_HEALTH = _env_flag("LOG_HEALTH", True)
+LOG_SUMMARY = _env_flag("LOG_SUMMARY", True)
+# quiet mode turns the per-event categories off unless one is explicitly set
+_q = not LOG_QUIET
+LOG_READS = _env_flag("LOG_READS", _q)
+LOG_WRITES = _env_flag("LOG_WRITES", _q)
+LOG_RELAY = _env_flag("LOG_RELAY", _q)
+LOG_STALE = _env_flag("LOG_STALE", _q)
+LOG_BLOCKED = _env_flag("LOG_BLOCKED", _q)
+LOG_CONN = _env_flag("LOG_CONN", _q)
+LOG_DEGRADED = _env_flag("LOG_DEGRADED", _q)
+LOG_POLL = _env_flag("LOG_POLL", False)
 
 
-class _Tee:
-    """Mirror a text stream to a second file object (console + logfile)."""
+# === Logging setup ===
+logger = logging.getLogger("sun2000_proxy")
 
-    def __init__(self, stream, fh):
-        self._stream = stream
-        self._fh = fh
 
-    def write(self, data):
-        n = self._stream.write(data)
+def _setup_logging():
+    logger.setLevel(getattr(logging, LOG_LEVEL.upper(), logging.INFO))
+    logger.propagate = False
+    fmt = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s", "%Y-%m-%d %H:%M:%S")
+    if LOG_CONSOLE:
+        h = logging.StreamHandler(sys.stderr)
+        h.setFormatter(fmt)
+        logger.addHandler(h)
+    if LOG_FILE:
         try:
-            self._fh.write(data)
-        except Exception:
-            pass
-        return n
+            if LOG_FILE_MAX_MB > 0:
+                fh = logging.handlers.RotatingFileHandler(
+                    LOG_FILE, maxBytes=int(LOG_FILE_MAX_MB * 1024 * 1024),
+                    backupCount=LOG_FILE_BACKUPS)
+            else:
+                fh = logging.FileHandler(LOG_FILE)
+            fh.setFormatter(fmt)
+            logger.addHandler(fh)
+        except OSError as e:
+            print(f"warning: cannot open LOG_FILE {LOG_FILE!r}: {e}", file=sys.stderr)
+    if not logger.handlers:
+        logger.addHandler(logging.NullHandler())
 
-    def flush(self):
-        self._stream.flush()
-        try:
-            self._fh.flush()
-        except Exception:
-            pass
-
-    def __getattr__(self, name):
-        return getattr(self._stream, name)
+    def _excepthook(exc_type, exc, tb):
+        logger.error("uncaught exception", exc_info=(exc_type, exc, tb))
+    sys.excepthook = _excepthook
 
 
-# Tee stdout/stderr to LOG_FILE before logging is configured, so log records (which the
-# StreamHandler writes to stderr), plain prints, and uncaught tracebacks all land in the file
-# as well as on the console. Set LOG_FILE="" (or /dev/null) to disable.
-if LOG_FILE:
-    try:
-        _logfh = open(LOG_FILE, "a", buffering=1)   # line-buffered append
-        sys.stdout = _Tee(sys.stdout, _logfh)
-        sys.stderr = _Tee(sys.stderr, _logfh)
-    except OSError as _e:
-        print(f"warning: cannot open LOG_FILE {LOG_FILE!r}: {_e}", file=sys.stderr)
+_setup_logging()
 
 if not DONGLE_HOST:
     raise SystemExit("SUN2000_HOST is not set. e.g. SUN2000_HOST=172.24.7.128 python3 "
                      "adaptive_modbus_cache_server.py")
+
+if HIGH_RISK_REPLY not in ("ack", "exception"):
+    raise SystemExit(f"HIGH_RISK_REPLY must be 'ack' or 'exception', got {HIGH_RISK_REPLY!r}")
+if DENY_REPLY not in ("ack", "exception"):
+    raise SystemExit(f"DENY_REPLY must be 'ack' or 'exception', got {DENY_REPLY!r}")
+
+
+class Counters:
+    """Everything the per-event log switches might be hiding, rolled up for the summary line."""
+
+    def __init__(self):
+        self.reads = 0
+        self.reads_cache = 0
+        self.reads_upstream = 0
+        self.reads_aged = 0
+        self.stale = 0
+        self.writes_ok = 0
+        self.writes_fail = 0
+        self.suppressed = 0
+        self.shadow_acks = 0
+        self.blocked_high_risk = 0
+        self.denied = 0
+        self.polls = 0
+        self.polls_failed = 0
+        self.queue_drops = 0
+        self.degraded_cycles = 0
+        self.client_connects = 0
+        self.write_retries = 0
+
+    def snapshot_and_reset(self):
+        d = {k: v for k, v in self.__dict__.items()}
+        for k in self.__dict__:
+            setattr(self, k, 0)
+        return d
+
+
+C = Counters()
+_n_read_log = itertools.count()
+_n_stale_log = itertools.count()
+_n_blocked_log = itertools.count()
+
+
+def _every_n(counter):
+    """True if this occurrence should be logged, honouring LOG_EVERY_N."""
+    if LOG_EVERY_N <= 0:
+        return False
+    return next(counter) % LOG_EVERY_N == 0
+
 
 FC_READ = 0x03
 FC_WRITE1 = 0x06
@@ -179,17 +340,15 @@ EXC_NAMES = {
     0x08: "MemoryParityError", 0x0A: "GatewayPathUnavailable", 0x0B: "GatewayTargetNoResponse",
 }
 
+# Priorities for the upstream queue (lower runs first).
+PRIO_WRITE = 0
+PRIO_CLIENT_READ = 1
+PRIO_POLL = 2
+
 
 def exc_name(code):
     return EXC_NAMES.get(code, f"Exc{code:#04x}")
 
-
-logging.basicConfig(
-    level=os.environ.get("LOG_LEVEL", "INFO"),
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    datefmt="%Y-%m-%d %H:%M:%S",
-)
-logger = logging.getLogger("sun2000_proxy")
 
 # === Register map (decoding / logging / value-based ACL) ===
 REGISTERS = {
@@ -212,6 +371,41 @@ ENUMS = {
     47087: {0: "disable", 1: "enable"},
     47589: {0: "local", 5: "three-party"},
 }
+
+# === Cache lifetimes ===
+# Tuned from 39h of observed traffic. The dominant cost was register 32000 (58% of all client
+# reads, identical value in 23,100 of 23,209 reads) being refetched on a flat 2s TTL, and
+# rating/identification registers that never change at all being treated the same way.
+# Ranges are (first, last, ttl_seconds) and are checked in order; REG_TTL wins over ranges.
+REG_TTL = {
+    30071: 3600.0,    # rated/config value - observed 100% constant over 39h
+    32000: 30.0,      # device state bitfield - 99.5% constant over 39h
+    32002: 30.0,      # alarm/state word
+}
+TTL_RANGES = [
+    (30000, 30099, 3600.0),    # identification / model / rating - static
+    (32000, 32015, 30.0),      # state & alarm words
+    (32016, 32079, 15.0),      # PV string voltages/currents
+    (32080, 32114, 5.0),       # active power, frequency, temperature, efficiency
+    (37100, 37200, 5.0),       # meter block
+    (37700, 37820, 5.0),       # battery block (power, SOC)
+    (38400, 38500, 30.0),      # battery pack detail (cell voltages/temps)
+    (47000, 47999, 60.0),      # configuration / setpoint registers
+]
+for _spec in os.environ.get("REG_TTL_OVERRIDES", "").split(","):
+    if _spec.strip():
+        _r, _t = _spec.split(":")
+        REG_TTL[int(_r)] = float(_t)
+
+
+def ttl_for(reg):
+    t = REG_TTL.get(reg)
+    if t is not None:
+        return t
+    for lo, hi, val in TTL_RANGES:
+        if lo <= reg <= hi:
+            return val
+    return READ_TTL
 
 
 def reg_int(addr, raws):
@@ -255,9 +449,16 @@ WRITE_ALLOW = {
     "172.24.1.15": [{"unit": None, "regs": None}],   # Reduxi EMS — may write anything (except high-risk)
     "172.24.1.97": [],                               # Home Assistant — no writes
 }
+# ACL_ALLOW_SRC grants full write access to extra source IPs without editing this file —
+# useful for a bench test or a temporary second controller. Still subject to the high-risk gate.
+for _ip in os.environ.get("ACL_ALLOW_SRC", "").split(","):
+    if _ip.strip():
+        WRITE_ALLOW[_ip.strip()] = [{"unit": None, "regs": None}]
 
 # High-risk writes are blocked for EVERYONE unless the source register is explicitly opted in
-# via HIGH_RISK_ALLOW, and are always logged prominently.
+# via HIGH_RISK_ALLOW. How a blocked one is ANSWERED is HIGH_RISK_REPLY (default "ack"):
+# answering EXC 0x01 made Reduxi log 44,041 device faults in 39h for a write we were
+# deliberately refusing, which is worse than quietly not performing it.
 HIGH_RISK = [
     (lambda unit, reg, val: reg == 47590 and val == 0,
      "47590 (Plant max charge-from-grid power)=0 disables charge-from-grid"),
@@ -336,6 +537,7 @@ class Upstream:
         self.fail_timeout = 0      # no reply within the per-attempt window
         self.fail_busy = 0         # dongle replied with EXC 0x06 ServerBusy
         self.fail_transport = 0    # connect/send/recv raised (socket-level)
+        self.drops = 0
 
     @property
     def connected(self):
@@ -365,6 +567,7 @@ class Upstream:
         self._writer = self._reader = None
         self._rxbuf = b""
         if w is not None:
+            self.drops += 1
             logger.warning(f"upstream DROPPED: {reason}")
             try:
                 w.close()
@@ -389,8 +592,11 @@ class Upstream:
         if deg != self.degraded:
             self.degraded = deg
             if deg:
-                logger.warning(f"upstream DEGRADED ({self.consecutive_failures} consecutive failures)")
-            else:
+                C.degraded_cycles += 1
+                if LOG_DEGRADED:
+                    logger.warning(f"upstream DEGRADED ({self.consecutive_failures} "
+                                   "consecutive failures)")
+            elif LOG_DEGRADED:
                 logger.info("upstream RECOVERED")
 
     async def read_frame(self, want_tx, timeout):
@@ -425,14 +631,15 @@ class Upstream:
 
 
 UP = None                       # Upstream, set in main()
-QUEUE = None                    # asyncio.Queue of (pdu, unit, future, enqueue_ts)
+QUEUE = None                    # asyncio.PriorityQueue of (prio, seq, pdu, unit, future, ts)
+_SEQ = itertools.count()
 
 
-async def submit(pdu, unit):
-    """Enqueue an upstream transaction and await its response body (unit + PDU). Raises
-    ModbusException-free here (callers interpret) but may raise TxnTimeout."""
+async def submit(pdu, unit, prio=PRIO_CLIENT_READ):
+    """Enqueue an upstream transaction and await its response body (unit + PDU).
+    Writes jump ahead of client reads, which jump ahead of background polling."""
     fut = asyncio.get_running_loop().create_future()
-    await QUEUE.put((pdu, unit, fut, time.monotonic()))
+    await QUEUE.put((prio, next(_SEQ), pdu, unit, fut, time.monotonic()))
     return await fut
 
 
@@ -508,67 +715,95 @@ async def _do_transaction(pdu, unit, deadline):
 
 async def upstream_worker():
     while True:
-        pdu, unit, fut, enq = await QUEUE.get()
-        wait_s = time.monotonic() - enq
-        wait_ms = wait_s * 1000
-        depth = QUEUE.qsize()
-        if wait_s > QUEUE_MAX_WAIT:
-            # Already stale by the time we got to it (queue was backed up behind a slow/
-            # stuck transaction) - fail fast without spending any upstream I/O on it, so we
-            # don't compound the backlog for whatever is still queued behind it.
-            if not fut.cancelled():
-                fut.set_exception(TxnTimeout())
-            logger.warning(f"queue-wait exceeded ({wait_s:.1f}s > {QUEUE_MAX_WAIT:g}s) "
-                           f"fc=0x{pdu[0]:02X} unit={unit} - dropped without upstream I/O")
-            QUEUE.task_done()
-            continue
-        deadline = time.monotonic() + TXN_MAX
-        attempts = 0
+        prio, _seq, pdu, unit, fut, enq = await QUEUE.get()
         try:
-            body, attempts = await _do_transaction(pdu, unit, deadline)
-            if not fut.cancelled():
-                fut.set_result(body)
-            res = f"exc{body[2]:#04x}" if (len(body) >= 3 and body[1] >= 0x80) else "ok"
-        except BaseException as e:
-            if not fut.cancelled():
-                fut.set_exception(e)
-            attempts = getattr(e, "attempts", attempts)
-            res = type(e).__name__
-        logger.debug(f"txn fc=0x{pdu[0]:02X} unit={unit} queue_wait={wait_ms:.0f}ms "
-                     f"depth={depth} attempts={attempts} -> {res}")
-        QUEUE.task_done()
+            wait_s = time.monotonic() - enq
+            depth = QUEUE.qsize()
+            # A backlogged CLIENT request is dropped rather than compounding the queue; a
+            # backlogged POLL is simply skipped (the poller will pick it up again when due).
+            if wait_s > QUEUE_MAX_WAIT:
+                C.queue_drops += 1
+                if not fut.cancelled() and not fut.done():
+                    fut.set_exception(TxnTimeout())
+                if prio != PRIO_POLL:
+                    logger.warning(f"queue-wait exceeded ({wait_s:.1f}s > {QUEUE_MAX_WAIT:g}s) "
+                                   f"fc=0x{pdu[0]:02X} unit={unit} - dropped without upstream I/O")
+                continue
+            deadline = time.monotonic() + TXN_MAX
+            attempts = 0
+            try:
+                body, attempts = await _do_transaction(pdu, unit, deadline)
+                if not fut.cancelled() and not fut.done():
+                    fut.set_result(body)
+                res = f"exc{body[2]:#04x}" if (len(body) >= 3 and body[1] >= 0x80) else "ok"
+            except asyncio.CancelledError:
+                # Shutdown. Previously this was swallowed by the broad BaseException handler
+                # below and the worker looped forever, so cancel()+gather() in main() never
+                # returned and the process had to be SIGKILLed - and a still-open client could
+                # even make it reconnect upstream after "shutting down...". Propagate instead.
+                if not fut.cancelled() and not fut.done():
+                    fut.cancel()
+                raise
+            except BaseException as e:
+                if not fut.cancelled() and not fut.done():
+                    fut.set_exception(e)
+                attempts = getattr(e, "attempts", attempts)
+                res = type(e).__name__
+            logger.debug(f"txn prio={prio} fc=0x{pdu[0]:02X} unit={unit} "
+                         f"queue_wait={wait_s * 1000:.0f}ms depth={depth} "
+                         f"attempts={attempts} -> {res}")
+        finally:
+            QUEUE.task_done()
 
 
 async def keepalive_loop():
-    if KEEPALIVE <= 0:
+    # Redundant while the poller is running - the poller is constantly talking to the dongle.
+    if KEEPALIVE <= 0 or POLL_ENABLE:
         return
     while True:
         await asyncio.sleep(KEEPALIVE)
         if UP.connected and (time.monotonic() - UP.last_txn) >= KEEPALIVE:
             try:
-                await submit(struct.pack(">BHH", FC_READ, KEEPALIVE_REG, 1), KEEPALIVE_UNIT)
+                await submit(struct.pack(">BHH", FC_READ, KEEPALIVE_REG, 1), KEEPALIVE_UNIT,
+                             PRIO_POLL)
                 logger.debug("upstream keep-alive read ok")
             except Exception as e:
                 logger.debug(f"upstream keep-alive failed: {type(e).__name__}")
 
 
+def _fmt_summary(d):
+    parts = [f"reads={d['reads']}(cache={d['reads_cache']} up={d['reads_upstream']} "
+             f"aged={d['reads_aged']} stale={d['stale']})",
+             f"writes={d['writes_ok']}ok/{d['writes_fail']}fail",
+             f"retried={d['write_retries']}",
+             f"suppressed={d['suppressed']}", f"shadow_ack={d['shadow_acks']}",
+             f"high_risk_blocked={d['blocked_high_risk']}", f"denied={d['denied']}",
+             f"polls={d['polls']}({d['polls_failed']}fail)",
+             f"queue_drops={d['queue_drops']}", f"degraded_cycles={d['degraded_cycles']}",
+             f"client_conn={d['client_connects']}"]
+    return " ".join(parts)
+
+
 async def health_loop():
     while True:
         await asyncio.sleep(HEALTH_INTERVAL)
-        age = (time.monotonic() - UP.last_success) if UP.last_success else -1
-        logger.info(f"health: connected={UP.connected} degraded={UP.degraded} "
-                    f"consec_fail={UP.consecutive_failures} last_ok={age:.0f}s "
-                    f"last_latency={UP.last_latency_ms:.0f}ms "
-                    f"queue_depth={QUEUE.qsize()} suppressed_writes={_suppressed_count} "
-                    f"shadow_acks={_shadow_ack_count} "
-                    f"stale_reads={_stale_count} "
-                    f"fail_timeout={UP.fail_timeout} fail_busy={UP.fail_busy} "
-                    f"fail_transport={UP.fail_transport}")
+        if LOG_HEALTH:
+            age = (time.monotonic() - UP.last_success) if UP.last_success else -1
+            logger.info(f"health: connected={UP.connected} degraded={UP.degraded} "
+                        f"consec_fail={UP.consecutive_failures} last_ok={age:.0f}s "
+                        f"last_latency={UP.last_latency_ms:.0f}ms "
+                        f"queue_depth={QUEUE.qsize()} cached_regs={len(CACHE)} "
+                        f"polled_regs={len(DEMAND)} drops={UP.drops} "
+                        f"fail_timeout={UP.fail_timeout} fail_busy={UP.fail_busy} "
+                        f"fail_transport={UP.fail_transport}")
+        snap = C.snapshot_and_reset()
+        if LOG_SUMMARY:
+            logger.info(f"summary({HEALTH_INTERVAL:g}s): {_fmt_summary(snap)}")
 
 
 # Upstream verbs (all go through the single worker)
-async def up_read(unit, addr, count):
-    body = await submit(struct.pack(">BHH", FC_READ, addr, count), unit)
+async def up_read(unit, addr, count, prio=PRIO_CLIENT_READ):
+    body = await submit(struct.pack(">BHH", FC_READ, addr, count), unit, prio)
     if body[1] >= 0x80:
         raise ModbusException(body[2])
     bc = body[2]
@@ -576,7 +811,7 @@ async def up_read(unit, addr, count):
 
 
 async def up_write(unit, addr, value):
-    body = await submit(struct.pack(">BHH", FC_WRITE1, addr, value), unit)
+    body = await submit(struct.pack(">BHH", FC_WRITE1, addr, value), unit, PRIO_WRITE)
     if body[1] >= 0x80:
         raise ModbusException(body[2])
     return True
@@ -585,25 +820,43 @@ async def up_write(unit, addr, value):
 async def up_write_multiple(unit, addr, values):
     n = len(values)
     pdu = struct.pack(">BHHB", FC_WRITE_N, addr, n, n * 2) + struct.pack(">" + "H" * n, *values)
-    body = await submit(pdu, unit)
+    body = await submit(pdu, unit, PRIO_WRITE)
     if body[1] >= 0x80:
         raise ModbusException(body[2])
     return True
 
 
 async def up_relay(unit, pdu):
-    body = await submit(bytes(pdu), unit)
+    body = await submit(bytes(pdu), unit, PRIO_CLIENT_READ)
     return body[1:]
 
 
-# === Read-through cache (short TTL; coalesces near-simultaneous identical reads) ===
-CACHE = {}
+# === Cache + demand tracking ===
+CACHE = {}                 # (unit, reg) -> (value, monotonic_ts)
 CACHE_LOCK = asyncio.Lock()
 INFLIGHT = {}
+DEMAND = {}                # (unit, reg) -> last time a client asked for it
+BG_FETCHES = set()         # strong refs to shielded background _fetch() tasks - see _bg_done
 
 
-def _fresh(entry, now):
-    return entry is not None and (now - entry[1]) <= READ_TTL
+def _bg_done(task):
+    # asyncio.shield() only holds a WEAK reference to a bare coroutine/task passed to it
+    # (documented in shield()'s own docstring): once the caller's own wait_for budget expires
+    # and it stops awaiting, nothing else keeps the background fetch alive, so it can be
+    # garbage-collected mid-flight - and if it then raises, there is nothing left to retrieve
+    # the exception from, producing "Task exception was never retrieved". Keeping a strong
+    # reference here until the task is actually done (this callback fires) prevents that; the
+    # explicit .exception() call is what marks it retrieved regardless of asyncio version.
+    BG_FETCHES.discard(task)
+    if not task.cancelled():
+        exc = task.exception()
+        if exc is not None:
+            logger.debug(f"background fetch failed after client stopped waiting: "
+                         f"{type(exc).__name__}")
+
+
+def _fresh(entry, now, ttl):
+    return entry is not None and (now - entry[1]) <= ttl
 
 
 def _runs(addrs, max_run):
@@ -616,59 +869,155 @@ def _runs(addrs, max_run):
     return runs
 
 
-async def _fetch(unit, start, count):
+async def _fetch(unit, start, count, prio=PRIO_CLIENT_READ):
     key = (unit, start, count)
     existing = INFLIGHT.get(key)
     if existing is not None:
-        return await existing
+        return await asyncio.shield(existing)
     fut = asyncio.get_running_loop().create_future()
     INFLIGHT[key] = fut
     try:
-        values = await up_read(unit, start, count)
+        values = await up_read(unit, start, count, prio)
     except BaseException as e:
-        fut.set_exception(e)
+        if not fut.done():
+            fut.set_exception(e)
         INFLIGHT.pop(key, None)
         fut.exception()
         raise
-    fut.set_result(values)
+    if not fut.done():
+        fut.set_result(values)
     INFLIGHT.pop(key, None)
+    await _store(unit, start, values)
     return values
 
 
-async def serve_read(unit, start, count):
-    now = time.monotonic()
+async def _store(unit, start, values):
+    ts = time.monotonic()
     async with CACHE_LOCK:
-        needed = [start + i for i in range(count)
-                  if not _fresh(CACHE.get((unit, start + i)), now)]
+        for i, v in enumerate(values):
+            CACHE[(unit, start + i)] = (v, ts)
+
+
+async def serve_read(unit, start, count):
+    """Answer a client read.
+
+    With SERVE_FROM_CACHE (the default) a client NEVER waits on the dongle for a register we
+    already hold a value for, however old - the poller is responsible for freshness. Only a
+    register we have never read at all is fetched synchronously, and only once.
+    """
+    now = time.monotonic()
+    addrs = [start + i for i in range(count)]
+    for a in addrs:
+        DEMAND[(unit, a)] = now
+
+    async with CACHE_LOCK:
+        unknown = [a for a in addrs if CACHE.get((unit, a)) is None]
+        stale = [a for a in addrs
+                 if CACHE.get((unit, a)) is not None
+                 and not _fresh(CACHE[(unit, a)], now, ttl_for(a))]
+
     result = "cache"
     fail_reason = ""
-    for s, c in _runs(needed, MAX_READ):
+    # Registers we have never seen must be fetched - there is nothing to serve otherwise.
+    # This is the ONLY case where a client can block, and it is bounded well below TXN_MAX:
+    # a sick dongle must not turn a first-touch read into a 10s client stall (that is how HA
+    # ends up "unavailable"). On expiry the register stays in DEMAND, so the poller fetches it
+    # and the next client read is served from cache.
+    need = list(unknown)
+    if not SERVE_FROM_CACHE:
+        need = sorted(set(unknown) | set(stale))
+    budget = CLIENT_READ_MAX_WAIT
+    for s, c in _runs(need, MAX_READ):
+        t0 = time.monotonic()
         try:
-            values = await _fetch(unit, s, c)
-            ts = time.monotonic()
-            async with CACHE_LOCK:
-                for i, v in enumerate(values):
-                    CACHE[(unit, s + i)] = (v, ts)
+            if budget > 0:
+                # shield: if this client gives up, the fetch still completes in the
+                # background and primes the cache for the next read instead of being
+                # thrown away (which is what starved a cold cache on a busy dongle).
+                # create_task + BG_FETCHES: shield() only weakly references a bare coroutine,
+                # so the background task must be kept alive explicitly or it can be
+                # garbage-collected mid-flight - see _bg_done.
+                bg = asyncio.create_task(_fetch(unit, s, c))
+                BG_FETCHES.add(bg)
+                bg.add_done_callback(_bg_done)
+                await asyncio.wait_for(asyncio.shield(bg), timeout=budget)
+            else:
+                await _fetch(unit, s, c)
             result = "upstream"
         except ModbusException as e:
             raise CannotServe(e.code)
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             result = "stale"
             fail_reason = f"{type(e).__name__}: {e}" if str(e) else type(e).__name__
+        if CLIENT_READ_MAX_WAIT > 0:
+            budget = max(0.05, budget - (time.monotonic() - t0))
+
     async with CACHE_LOCK:
         out = []
-        for i in range(count):
-            ce = CACHE.get((unit, start + i))
+        oldest = 0.0
+        for a in addrs:
+            ce = CACHE.get((unit, a))
             if ce is None:
                 raise CannotServe(EXC_GATEWAY_NO_RESPONSE)
             out.append(ce[0])
-    return out, result, fail_reason
+            oldest = max(oldest, now - ce[1])
+
+    if CACHE_MAX_AGE > 0 and oldest > CACHE_MAX_AGE:
+        raise CannotServe(EXC_GATEWAY_NO_RESPONSE)
+    if result == "cache" and stale:
+        result = "aged"          # served from cache, older than its TTL, poller behind
+    return out, result, fail_reason, oldest
+
+
+# === Background poller: the only thing that routinely talks to the dongle ===
+async def poll_loop():
+    if not POLL_ENABLE:
+        return
+    while True:
+        await asyncio.sleep(POLL_INTERVAL)
+        # Polls are the lowest queue priority, so writes and client reads already overtake
+        # them - there is no need to stand down just because the queue is non-empty, and
+        # doing so starved the poller exactly when it was needed most (a busy dongle plus a
+        # retrying client kept the queue permanently non-empty, so the cache never primed).
+        # Only back off from a genuinely deep backlog.
+        if QUEUE.qsize() > POLL_BACKLOG_PAUSE:
+            continue
+        now = time.monotonic()
+        due = []
+        for (unit, reg), asked in list(DEMAND.items()):
+            if now - asked > DEMAND_TTL:
+                DEMAND.pop((unit, reg), None)
+                continue
+            ttl = ttl_for(reg)
+            ce = CACHE.get((unit, reg))
+            age = (now - ce[1]) if ce else 1e9
+            if age > ttl:
+                due.append((age / ttl, unit, reg))
+        if not due:
+            continue
+        # Most overdue first, then coalesce that unit's due registers into one block read.
+        due.sort(reverse=True)
+        _, unit, _reg = due[0]
+        regs = sorted(r for (_o, u, r) in due if u == unit)
+        runs = _runs(regs, POLL_MAX_RUN)
+        s, c = runs[0]
+        try:
+            await _fetch(unit, s, c, PRIO_POLL)
+            C.polls += 1
+            if LOG_POLL:
+                rng = f"{s}" if c == 1 else f"{s}..{s + c - 1}"
+                logger.info(f"POLL  unit={unit} reg={rng} ok")
+        except Exception as e:
+            C.polls_failed += 1
+            if LOG_POLL:
+                logger.info(f"POLL  unit={unit} reg={s}..{s + c - 1} failed "
+                            f"{type(e).__name__}")
 
 
 # === Write suppression ===
 LAST_WRITE = {}
-_suppressed_count = 0
-_stale_count = 0
 
 
 def should_suppress(unit, start, count, vals, now):
@@ -684,13 +1033,7 @@ def should_suppress(unit, start, count, vals, now):
 
 
 # === Shadow-ack for chronically flaky registers (e.g. 47112) ===
-# Unlike should_suppress (which requires a prior genuine upstream ACK as its baseline -
-# useless for a register that never actually succeeds), this tracks the last value
-# ATTEMPTED upstream regardless of outcome. A repeat of that same value is ACKed locally
-# without ever touching the dongle, so a client's own rapid retry loop against a register
-# the dongle periodically won't answer can't keep seizing the shared queue.
 SHADOW_WRITE = {}
-_shadow_ack_count = 0
 
 
 def should_shadow_ack(unit, start, count, vals, now):
@@ -703,6 +1046,65 @@ def should_shadow_ack(unit, start, count, vals, now):
     if elapsed >= REFRESH:
         return False
     return elapsed < HOLD
+
+
+# === Background-confirm for registers that DO reach the device, just unreliably (47416) ===
+# Plain shadow-ack (above) is only safe when a blocked/failed write has no real consequence -
+# 47112 is mostly rejected outright by the device, so faking success costs little. 47416
+# ("Maximum Feed Grid Power") is different: ~10% of attempts genuinely land, so silently
+# ACKing every retry forever would let the client believe a value is set that the inverter
+# never actually received. Instead the client is only ACKed early once a background task is
+# actively still trying to land that EXACT value - and that task keeps trying (slowly, so it
+# can't reproduce the queue-starvation problem) until it succeeds or gives up, logging loudly
+# either way so a lasting mismatch is never silent.
+BG_CONFIRM = {}           # (unit, start) -> {"vals": tuple, "count": int, "landed": bool, "gave_up": bool}
+BG_CONFIRM_TASKS = set()  # strong refs to background confirm-retry tasks - see _bg_confirm_task_done
+
+
+def _bg_confirm_task_done(task):
+    # Same GC-safety concern as BG_FETCHES/_bg_done: a bare asyncio.create_task result with no
+    # other reference can be collected mid-flight, and an unretrieved exception on a collected
+    # task logs "Task exception was never retrieved". Keep a strong ref until done, then
+    # explicitly retrieve.
+    BG_CONFIRM_TASKS.discard(task)
+    if not task.cancelled():
+        exc = task.exception()
+        if exc is not None:
+            logger.debug(f"background confirm task ended with: {type(exc).__name__}")
+
+
+async def _bg_confirm_loop(src, unit, fc, start, raws, count, name, dec, rng):
+    key = (unit, start)
+    vals = tuple(raws)
+    for attempt in range(1, BG_CONFIRM_MAX_ATTEMPTS + 1):
+        await asyncio.sleep(BG_CONFIRM_INTERVAL)
+        rec = BG_CONFIRM.get(key)
+        if rec is None or rec["vals"] != vals:
+            return    # superseded by a newer client write (or cleared) - abandon quietly
+        try:
+            await _attempt_write(unit, fc, start, raws)
+            async with CACHE_LOCK:
+                for i in range(count):
+                    CACHE.pop((unit, start + i), None)
+            LAST_WRITE[(unit, start)] = {"count": count, "vals": vals, "ts": time.monotonic()}
+            rec["landed"] = True
+            logger.warning(f"BG-CONFIRM landed src={src} unit={unit} reg={rng} {name}={dec} "
+                           f"after {attempt} background attempt(s) - device now matches what "
+                           f"the client was told")
+            record_audit(src, unit, fc, start, reg_int(start, raws), "bg-confirm-landed")
+            return
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            continue
+    rec = BG_CONFIRM.get(key)
+    if rec is not None and rec["vals"] == vals:
+        rec["gave_up"] = True
+        logger.warning(f"BG-CONFIRM GAVE UP src={src} unit={unit} reg={rng} {name}={dec} after "
+                       f"{BG_CONFIRM_MAX_ATTEMPTS} background attempts over "
+                       f"{BG_CONFIRM_MAX_ATTEMPTS * BG_CONFIRM_INTERVAL:g}s - the device almost "
+                       f"certainly does NOT have this value even though the client was told it did")
+        record_audit(src, unit, fc, start, reg_int(start, raws), "bg-confirm-gave-up")
 
 
 # === Register audit ===
@@ -726,10 +1128,12 @@ def dump_audit(reason):
     def ts(t):
         return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(t))
     lines = [f"# register audit ({reason}) generated {ts(time.time())}",
-             "src\tunit\tfc\treg\tname\tcount\tfirst_seen\tlast_seen\tlast_result\tdistinct_values"]
-    for (src, unit, fc, reg), e in sorted(AUDIT.items(), key=lambda kv: tuple("" if x is None else x for x in kv[0])):
+             "src\tunit\tfc\treg\tname\tttl_s\tcount\tfirst_seen\tlast_seen\tlast_result\tdistinct_values"]
+    for (src, unit, fc, reg), e in sorted(
+            AUDIT.items(), key=lambda kv: tuple("" if x is None else x for x in kv[0])):
         name = REGISTERS.get(reg, ("", ))[0]
-        lines.append(f"{src}\t{unit}\t0x{fc:02X}\t{reg}\t{name}\t{e['count']}\t"
+        ttl = f"{ttl_for(reg):g}" if reg is not None else ""
+        lines.append(f"{src}\t{unit}\t0x{fc:02X}\t{reg}\t{name}\t{ttl}\t{e['count']}\t"
                      f"{ts(e['first'])}\t{ts(e['last'])}\t{e['result']}\t{sorted(e['vals'])}")
     try:
         tmp = AUDIT_FILE + ".tmp"
@@ -742,6 +1146,9 @@ def dump_audit(reason):
 
 
 # === Modbus TCP server ===
+CLIENTS = set()
+
+
 def _reply(writer, tx_id, unit_id, pdu):
     writer.write(struct.pack(">HHHB", tx_id, 0, len(pdu) + 1, unit_id) + pdu)
 
@@ -753,7 +1160,10 @@ def _exc_pdu(fc, code):
 async def handle_client(reader, writer):
     addr = writer.get_extra_info("peername")
     src = addr[0] if addr else "?"
-    logger.info(f"client connected: {addr}")
+    CLIENTS.add(writer)
+    C.client_connects += 1
+    if LOG_CONN:
+        logger.info(f"client connected: {addr}")
     try:
         while True:
             try:
@@ -784,10 +1194,14 @@ async def handle_client(reader, writer):
             await writer.drain()
     except (asyncio.IncompleteReadError, asyncio.TimeoutError, ConnectionResetError):
         pass
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
         logger.warning(f"client {src} error: {type(e).__name__}: {e}")
     finally:
-        logger.info(f"client disconnected: {addr}")
+        CLIENTS.discard(writer)
+        if LOG_CONN:
+            logger.info(f"client disconnected: {addr}")
         try:
             writer.close()
             await writer.wait_closed()
@@ -802,29 +1216,115 @@ async def _do_read(writer, src, tx_id, unit, pdu):
         return
     values = None
     fail_reason = ""
+    age = 0.0
     try:
-        values, result, fail_reason = await serve_read(unit, start, count)
+        values, result, fail_reason, age = await serve_read(unit, start, count)
         resp = struct.pack(">BB", FC_READ, count * 2) + struct.pack(">" + "H" * count, *values)
         _reply(writer, tx_id, unit, resp)
     except CannotServe as e:
         result = f"EXC {e.code:#04x} {exc_name(e.code)}"
         _reply(writer, tx_id, unit, _exc_pdu(FC_READ, e.code))
+
+    C.reads += 1
+    if result == "cache":
+        C.reads_cache += 1
+    elif result == "upstream":
+        C.reads_upstream += 1
+    elif result == "aged":
+        C.reads_aged += 1
+
     rng = f"{start}" if count == 1 else f"{start}..{start + count - 1}"
     if result == "stale":
-        # The upstream read failed and we served a last-known cached value instead. This is a
-        # health signal, not routine poll chatter - always log it, even for READ_LOG_MUTE
-        # sources, so a chronically-failing register doesn't silently serve old data for hours.
-        global _stale_count
-        _stale_count += 1
-        logger.warning(f"STALE #{_stale_count} src={src} unit={unit} fc=0x03 reg={rng} "
-                       f"reason={fail_reason or 'unknown'} queue_depth={QUEUE.qsize()} "
-                       f"(upstream read failed, served last-known cached value)")
-    elif src not in READ_LOG_MUTE:      # noisy pollers (HA) are served + audited, not logged
+        # The upstream read failed and we served a last-known cached value instead. A health
+        # signal, not routine poll chatter - logged even for READ_LOG_MUTE sources.
+        C.stale += 1
+        if LOG_STALE and _every_n(_n_stale_log):
+            logger.warning(f"STALE src={src} unit={unit} fc=0x03 reg={rng} "
+                           f"reason={fail_reason or 'unknown'} age={age:.0f}s "
+                           f"queue_depth={QUEUE.qsize()} "
+                           f"(upstream read failed, served last-known cached value)")
+    elif LOG_READS and src not in READ_LOG_MUTE and _every_n(_n_read_log):
         name, dec = decode_reg(start, values) if values else ("", "")
         logger.info(f"READ  src={src} unit={unit} fc=0x03 reg={rng} raw={_raw_str(values)}"
-                    f"{(' ' + name + '=' + dec) if name else ''} result={result}")
+                    f"{(' ' + name + '=' + dec) if name else ''} result={result} "
+                    f"age={age:.1f}s")
     for i in range(count):
         record_audit(src, unit, FC_READ, start + i, values[i] if values else None, result)
+
+
+async def _attempt_write(unit, fc, start, raws):
+    if fc == FC_WRITE1:
+        await up_write(unit, start, raws[0])
+    else:
+        await up_write_multiple(unit, start, raws)
+
+
+async def _do_bg_confirm_write(writer, tx_id, src, unit, fc, start, count, raws, value,
+                                name, dec, rng, echo):
+    """Write path for BG_CONFIRM_REGS (default 47416). Always tries for real first; a client
+    retry of the SAME value while a background attempt is still in flight (or has already
+    landed) is answered immediately with no upstream I/O. A new value always preempts and is
+    tried for real again. See the BG_CONFIRM section above for why this differs from
+    should_shadow_ack."""
+    key = (unit, start)
+    vals = tuple(raws)
+    rec = BG_CONFIRM.get(key)
+
+    if rec is not None and rec["vals"] == vals and not rec["gave_up"]:
+        # Either still being chased in the background, or already landed - either way the
+        # client doesn't need to resend it, and resending would just restart the chase.
+        C.shadow_acks += 1
+        if LOG_WRITES:
+            status = "already landed" if rec["landed"] else "still retrying in the background"
+            logger.info(f"BG-CONFIRM shadow-ack src={src} unit={unit} reg={rng} {name}={dec} "
+                        f"({status})")
+        record_audit(src, unit, fc, start, value,
+                     "bg-confirm-already-landed" if rec["landed"] else "bg-confirm-shadow-ack")
+        _reply(writer, tx_id, unit, echo)
+        return
+
+    # A new value (or the previous attempt for this exact value gave up) - always try it for
+    # real, synchronously, exactly like a normal write.
+    BG_CONFIRM[key] = {"vals": vals, "count": count, "landed": False, "gave_up": False}
+    try:
+        await _attempt_write(unit, fc, start, raws)
+        async with CACHE_LOCK:
+            for i in range(count):
+                CACHE.pop((unit, start + i), None)
+        LAST_WRITE[(unit, start)] = {"count": count, "vals": vals, "ts": time.monotonic()}
+        BG_CONFIRM[key]["landed"] = True
+        _reply(writer, tx_id, unit, echo)
+        C.writes_ok += 1
+        if LOG_WRITES:
+            logger.info(f"WRITE src={src} unit={unit} fc=0x{fc:02X} reg={rng} raw={_raw_str(raws)} "
+                        f"{name}={dec} result=ACK")
+        record_audit(src, unit, fc, start, value, "ACK")
+        return
+    except ModbusException as e:
+        # A real rejection from the device - retrying will not change its mind.
+        result = f"EXC {e.code:#04x} {exc_name(e.code)}"
+        _reply(writer, tx_id, unit, _exc_pdu(fc, e.code))
+        C.writes_fail += 1
+        if LOG_WRITES:
+            logger.info(f"WRITE src={src} unit={unit} fc=0x{fc:02X} reg={rng} raw={_raw_str(raws)} "
+                        f"{name}={dec} result={result}")
+        record_audit(src, unit, fc, start, value, result)
+        BG_CONFIRM.pop(key, None)
+        return
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        pass   # TxnTimeout / transport give-up: fall through to ACK-now + background-confirm
+
+    task = asyncio.create_task(_bg_confirm_loop(src, unit, fc, start, raws, count, name, dec, rng))
+    BG_CONFIRM_TASKS.add(task)
+    task.add_done_callback(_bg_confirm_task_done)
+    if LOG_WRITES:
+        logger.warning(f"BG-CONFIRM src={src} unit={unit} reg={rng} {name}={dec} did not land "
+                       f"synchronously - ACKing client now, retrying in the background every "
+                       f"{BG_CONFIRM_INTERVAL:g}s (up to {BG_CONFIRM_MAX_ATTEMPTS}x)")
+    record_audit(src, unit, fc, start, value, "bg-confirm-pending")
+    _reply(writer, tx_id, unit, echo)
 
 
 async def _do_write(writer, src, tx_id, unit, fc, pdu):
@@ -851,66 +1351,101 @@ async def _do_write(writer, src, tx_id, unit, fc, pdu):
     # ACL (deny by default)
     allowed, reason = check_write_allowed(src, unit, start, count, value)
     if not allowed:
-        logger.warning(f"DENY  src={src} unit={unit} fc=0x{fc:02X} reg={rng} raw={_raw_str(raws)} "
-                       f"{name}={dec} reason={reason}")
+        C.denied += 1
+        if LOG_BLOCKED and _every_n(_n_blocked_log):
+            logger.warning(f"DENY  src={src} unit={unit} fc=0x{fc:02X} reg={rng} "
+                           f"raw={_raw_str(raws)} {name}={dec} reason={reason} "
+                           f"(reply={DENY_REPLY})")
         record_audit(src, unit, fc, start, value, "denied")
-        _reply(writer, tx_id, unit, _exc_pdu(fc, EXC_ILLEGAL_FUNCTION))
+        if DENY_REPLY == "ack":
+            _reply(writer, tx_id, unit, echo)
+        else:
+            _reply(writer, tx_id, unit, _exc_pdu(fc, EXC_ILLEGAL_FUNCTION))
         return
 
-    # High-risk gate (blocked unless explicitly allowlisted; only the block is logged)
+    # High-risk gate (blocked unless explicitly allowlisted)
     hr = high_risk_match(unit, start, value)
     if hr and start not in HIGH_RISK_ALLOW.get(src, set()):
-        logger.warning(f"HIGH-RISK WRITE BLOCKED src={src} unit={unit} reg={rng} "
-                       f"{name}={dec} [{hr}] (add {start} to HIGH_RISK_ALLOW[{src!r}] to permit)")
+        C.blocked_high_risk += 1
+        if LOG_BLOCKED and _every_n(_n_blocked_log):
+            logger.warning(f"HIGH-RISK WRITE BLOCKED src={src} unit={unit} reg={rng} "
+                           f"{name}={dec} [{hr}] (reply={HIGH_RISK_REPLY}; add {start} to "
+                           f"HIGH_RISK_ALLOW[{src!r}] to permit)")
         record_audit(src, unit, fc, start, value, "high-risk-blocked")
-        _reply(writer, tx_id, unit, _exc_pdu(fc, EXC_ILLEGAL_FUNCTION))
+        if HIGH_RISK_REPLY == "ack":
+            # Answer as if written, without touching the dongle. Refusing the write is the
+            # point; answering EXC 0x01 to a control system just makes it log device faults
+            # (44,041 of them in 39h) and retry harder.
+            _reply(writer, tx_id, unit, echo)
+        else:
+            _reply(writer, tx_id, unit, _exc_pdu(fc, EXC_ILLEGAL_FUNCTION))
         return
 
     now = time.monotonic()
     if should_suppress(unit, start, count, tuple(raws), now):
-        global _suppressed_count
-        _suppressed_count += 1
-        logger.debug(f"SUPPRESS #{_suppressed_count} src={src} unit={unit} reg={rng} "
-                     f"{name}={dec} (unchanged, within {HOLD:g}s)")
+        C.suppressed += 1
+        logger.debug(f"SUPPRESS src={src} unit={unit} reg={rng} {name}={dec} "
+                     f"(unchanged, within {HOLD:g}s)")
         record_audit(src, unit, fc, start, value, "suppressed")
         _reply(writer, tx_id, unit, echo)
         return
 
     if should_shadow_ack(unit, start, count, tuple(raws), now):
-        global _shadow_ack_count
-        _shadow_ack_count += 1
-        logger.info(f"SHADOW-ACK #{_shadow_ack_count} src={src} unit={unit} reg={rng} "
-                    f"{name}={dec} (same value already attempted upstream recently, "
-                    f"not resent to dongle)")
+        C.shadow_acks += 1
+        if LOG_WRITES:
+            logger.info(f"SHADOW-ACK src={src} unit={unit} reg={rng} {name}={dec} "
+                        f"(same value already attempted upstream recently, not resent)")
         record_audit(src, unit, fc, start, value, "shadow-ack")
         _reply(writer, tx_id, unit, echo)
         return
 
-    try:
-        if fc == FC_WRITE1:
-            await up_write(unit, start, raws[0])
-        else:
-            await up_write_multiple(unit, start, raws)
-        async with CACHE_LOCK:
-            for i in range(count):
-                CACHE.pop((unit, start + i), None)
-        LAST_WRITE[(unit, start)] = {"count": count, "vals": tuple(raws), "ts": now}
-        _reply(writer, tx_id, unit, echo)
-        result = "ACK"
-    except ModbusException as e:
-        result = f"EXC {e.code:#04x} {exc_name(e.code)}"
-        _reply(writer, tx_id, unit, _exc_pdu(fc, e.code))
-    except Exception as e:                      # TxnTimeout / cancelled / transport give-up
-        result = f"FAIL {type(e).__name__}"
-        _reply(writer, tx_id, unit, _exc_pdu(fc, EXC_DEVICE_FAILURE))
-    finally:
-        # Remember what we attempted upstream regardless of outcome, so a client's rapid
-        # retry of the SAME value against a chronically flaky register (see SHADOW_ACK_REGS)
-        # doesn't keep resending - one attempt is enough to have "tried".
-        if start in SHADOW_ACK_REGS:
-            SHADOW_WRITE[(unit, start)] = {"count": count, "vals": tuple(raws), "ts": now}
-    logger.info(f"WRITE src={src} unit={unit} fc=0x{fc:02X} reg={rng} raw={_raw_str(raws)} "
-                f"{name}={dec} result={result}")
+    if start in BG_CONFIRM_REGS:
+        await _do_bg_confirm_write(writer, tx_id, src, unit, fc, start, count, raws, value,
+                                    name, dec, rng, echo)
+        return
+
+    # Critical registers get extra upstream attempts before we report failure. Writes are rare
+    # (1,160 in 39h against 40k+ reads) so retrying them is cheap, and a 77%-failing write to a
+    # live power-limit register leaves the inverter enforcing whatever happened to get through.
+    tries = 1 + (WRITE_RETRIES if start in CONFIRM_REGS else 0)
+    result = None
+    for attempt in range(tries):
+        try:
+            await _attempt_write(unit, fc, start, raws)
+            async with CACHE_LOCK:
+                for i in range(count):
+                    CACHE.pop((unit, start + i), None)
+            LAST_WRITE[(unit, start)] = {"count": count, "vals": tuple(raws), "ts": now}
+            _reply(writer, tx_id, unit, echo)
+            result = "ACK" if attempt == 0 else f"ACK (retry {attempt})"
+            C.writes_ok += 1
+            break
+        except ModbusException as e:
+            # A real rejection from the device - retrying will not change its mind.
+            result = f"EXC {e.code:#04x} {exc_name(e.code)}"
+            _reply(writer, tx_id, unit, _exc_pdu(fc, e.code))
+            C.writes_fail += 1
+            break
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:                  # TxnTimeout / transport give-up
+            if attempt + 1 < tries:
+                C.write_retries += 1
+                logger.debug(f"write retry {attempt + 1}/{tries - 1} reg={rng} "
+                             f"after {type(e).__name__}")
+                continue
+            result = f"FAIL {type(e).__name__}"
+            _reply(writer, tx_id, unit, _exc_pdu(fc, EXC_DEVICE_FAILURE))
+            C.writes_fail += 1
+
+    # Remember what we attempted upstream regardless of outcome, so a client's rapid retry of
+    # the SAME value against a chronically flaky register doesn't keep resending.
+    if start in SHADOW_ACK_REGS:
+        SHADOW_WRITE[(unit, start)] = {"count": count, "vals": tuple(raws), "ts": now}
+
+    if LOG_WRITES:
+        logger.info(f"WRITE src={src} unit={unit} fc=0x{fc:02X} reg={rng} raw={_raw_str(raws)} "
+                    f"{name}={dec} result={result}")
     record_audit(src, unit, fc, start, value, result)
 
 
@@ -920,36 +1455,71 @@ async def _do_relay(writer, src, tx_id, unit, fc, pdu):
         resp = await up_relay(unit, pdu)
         _reply(writer, tx_id, unit, resp)
         result = f"EXC {resp[1]:#04x}" if (len(resp) >= 2 and resp[0] >= 0x80) else "relayed"
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
         result = f"FAIL {type(e).__name__}"
         _reply(writer, tx_id, unit, _exc_pdu(fc, EXC_DEVICE_FAILURE))
-    logger.info(f"RELAY src={src} unit={unit} fc=0x{fc:02X} ({kind}) result={result}")
+    if LOG_RELAY:
+        logger.info(f"RELAY src={src} unit={unit} fc=0x{fc:02X} ({kind}) result={result}")
     record_audit(src, unit, fc, None, None, result)
 
 
 # === Main ===
+def _banner():
+    logmode = []
+    for nm, on in (("reads", LOG_READS), ("writes", LOG_WRITES), ("stale", LOG_STALE),
+                   ("blocked", LOG_BLOCKED), ("conn", LOG_CONN), ("degraded", LOG_DEGRADED),
+                   ("poll", LOG_POLL), ("health", LOG_HEALTH), ("summary", LOG_SUMMARY)):
+        if on:
+            logmode.append(nm)
+    return (f"SUN2000 proxy listening on {SERVER_HOST}:{SERVER_PORT}; upstream "
+            f"{DONGLE_HOST}:{DONGLE_PORT}\n"
+            f"  scheduling: min-gap {MIN_GAP * 1000:.0f}ms, txn-cap {TXN_MAX:g}s, "
+            f"queue-wait-cap {QUEUE_MAX_WAIT:g}s, "
+            f"poller {'on' if POLL_ENABLE else 'OFF'}"
+            f"{f' @{POLL_INTERVAL:g}s/txn, max-run {POLL_MAX_RUN}' if POLL_ENABLE else ''}\n"
+            f"  cache: default ttl {READ_TTL:g}s, per-register overrides active, "
+            f"serve-from-cache {'on' if SERVE_FROM_CACHE else 'OFF'}, "
+            f"client-read-cap {CLIENT_READ_MAX_WAIT:g}s, "
+            f"max-age {CACHE_MAX_AGE:g}s{' (unlimited)' if CACHE_MAX_AGE <= 0 else ''}\n"
+            f"  writes: suppress {HOLD:g}/{REFRESH:g}s, shadow-ack {sorted(SHADOW_ACK_REGS)}, "
+            f"confirm {sorted(CONFIRM_REGS)} x{WRITE_RETRIES} retries, "
+            f"bg-confirm {sorted(BG_CONFIRM_REGS)} every {BG_CONFIRM_INTERVAL:g}s "
+            f"x{BG_CONFIRM_MAX_ATTEMPTS}, "
+            f"high-risk reply={HIGH_RISK_REPLY}, deny reply={DENY_REPLY}\n"
+            f"  logging: console {'on' if LOG_CONSOLE else 'OFF'}, "
+            f"file {LOG_FILE or 'OFF'}"
+            f"{f' (rotate {LOG_FILE_MAX_MB:g}MB x{LOG_FILE_BACKUPS})' if LOG_FILE and LOG_FILE_MAX_MB > 0 else ''}, "
+            f"every-n {LOG_EVERY_N}, enabled: {','.join(logmode) or 'none'}\n"
+            f"  audit -> {AUDIT_FILE}")
+
+
 async def main():
     global UP, QUEUE
     UP = Upstream(DONGLE_HOST, DONGLE_PORT)
-    QUEUE = asyncio.Queue()
+    QUEUE = asyncio.PriorityQueue()
 
     server = await asyncio.start_server(handle_client, SERVER_HOST, SERVER_PORT)
-    logger.info(f"SUN2000 proxy listening on {SERVER_HOST}:{SERVER_PORT}; upstream "
-                f"{DONGLE_HOST}:{DONGLE_PORT} (min-gap {MIN_GAP*1000:.0f}ms, read-ttl {READ_TTL:g}s, "
-                f"txn-cap {TXN_MAX:g}s, queue-wait-cap {QUEUE_MAX_WAIT:g}s, "
-                f"keepalive {KEEPALIVE:g}s, suppress {HOLD:g}/{REFRESH:g}s, "
-                f"audit -> {AUDIT_FILE}"
-                f"{', log -> ' + LOG_FILE if LOG_FILE else ''})")
+    logger.info(_banner())
+    if HIGH_RISK_REPLY == "ack":
+        logger.warning("HIGH_RISK_REPLY=ack: blocked high-risk writes are answered as if "
+                       "written. The client's view of those registers will not match the "
+                       "device. Set HIGH_RISK_REPLY=exception to refuse them visibly instead.")
 
     tasks = [asyncio.create_task(upstream_worker()),
              asyncio.create_task(keepalive_loop()),
+             asyncio.create_task(poll_loop()),
              asyncio.create_task(health_loop())]
 
     stop = asyncio.Event()
     loop = asyncio.get_running_loop()
-    loop.add_signal_handler(signal.SIGHUP, lambda: dump_audit("SIGHUP"))
-    for sig in (signal.SIGTERM, signal.SIGINT):
-        loop.add_signal_handler(sig, stop.set)
+    try:
+        loop.add_signal_handler(signal.SIGHUP, lambda: dump_audit("SIGHUP"))
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            loop.add_signal_handler(sig, stop.set)
+    except NotImplementedError:      # non-POSIX
+        pass
 
     await stop.wait()
 
@@ -957,11 +1527,28 @@ async def main():
     dump_audit("shutdown")
     for t in tasks:
         t.cancel()
-    await asyncio.gather(*tasks, return_exceptions=True)
+    # The worker used to swallow CancelledError and loop forever, so this gather never
+    # returned and the process had to be SIGKILLed. Bounded anyway, belt and braces.
+    try:
+        await asyncio.wait_for(asyncio.gather(*tasks, return_exceptions=True), timeout=10)
+    except asyncio.TimeoutError:
+        logger.warning("background tasks did not stop within 10s")
     server.close()
-    await server.wait_closed()
+    # Close client sockets ourselves: on Python 3.12.1+ wait_closed() blocks until every
+    # client handler has finished, and a client that just sits idle would hold shutdown for
+    # CLIENT_IDLE_TIMEOUT.
+    for w in list(CLIENTS):
+        try:
+            w.close()
+        except Exception:
+            pass
+    try:
+        await asyncio.wait_for(server.wait_closed(), timeout=5)
+    except asyncio.TimeoutError:
+        logger.warning("server socket did not close within 5s")
     if UP.connected:
         await UP.drop("shutdown")
+    logger.info("stopped")
 
 
 if __name__ == "__main__":

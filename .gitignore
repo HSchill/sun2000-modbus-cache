@@ -4,4 +4,5 @@ __pycache__/
 adaptive_cache_state.json
 adaptive_cache_state.json.tmp
 adaptive_cache.log
+adaptive_cache.log.*
 register_audit.tsv
